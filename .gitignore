@@ -1,0 +1,34 @@
+# ── 依赖与构建产物（都很大、都能重装/重打）──────────────────────────────
+node_modules/
+dist/
+*.asar
+
+# ── 运行时自动下载的二进制：单个就有 17~79MB，绝不该进仓库 ─────────────
+tools/
+
+# ── 本机用户数据：**绝对不能提交**（Cookie 泄露 = 账号被人接管）─────────
+tools/history.json
+tools/login-cookies.txt
+.config/
+settings.json
+*.part
+*.part.json
+
+# ── 生成出来的本地记录（里面是本机的图片路径）──────────────────────────
+build/icon-source.txt
+build/logo-source.txt
+
+# ── 测试/调试残留 ──────────────────────────────────────────────────────
+tests/.tmp/
+tests/.smoke/
+.npm-cache/
+*.report.json
+.tmp/
+
+# ── 编辑器与系统文件 ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store

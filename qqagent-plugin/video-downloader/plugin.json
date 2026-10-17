@@ -1,0 +1,188 @@
+{
+  "id": "video-downloader",
+  "name": "视频下载（肥鱼当劳）",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "media",
+  "description": "群里出现视频/图文链接 → 自动用本机的「肥鱼当劳（ds-download）」（源码目录 D:\\视频下载工具）把它下下来，然后把视频（或图文帖的图片）发回当前会话。\n\n【为什么是插件】核心 src/media-links.js 已经把这件事做成了**确定性调度**：它从消息里抽出候选链接，逐个问所有 media.download 提供者「谁认领谁处理」，全程不经过模型。规则能写死 = 插件；放进 skills/ 会因为「模型看不到 providers」而静默失效。\n\n【支持什么】已知平台：B站（含 b23.tv 短链、专栏 cv、图文 opus、直播）、抖音（视频/图文/短链）、YouTube、Twitter/X、Instagram、TikTok、快手、小红书、微博、知乎、Pixiv、微信文章 等（这些走工具自带的 yt-dlp + 内置浏览器兜底）；另外**任意直链**（.mp4/.mkv/.webm/.m3u8/.mp3…）也认。工具那边已有的能力（登录 Cookie、代理自动跟随系统代理、直播录制、图文帖逐张翻页、B站专栏只取正文图…）都会照常生效。\n\n【图文帖怎么发】图片默认**前 9 张直接发在群里、剩下的打包成一个 zip 当群文件发**（一张都不丢，也不刷屏）；压缩包名取帖子标题，并用一行文字说明来由。「图片超出上限怎么办」可切成 all（zip 里放全部图）或 off（只发前面几张）。\n\n【Pixiv 不需要代理】pixiv.net 在大陆直连不通，但本插件走的是一条**不需要代理**的路：搜图用公开检索接口（api.lolicon.app），取图用 pixiv.re 反代（实测返回的就是原图，字节数与官方一致，连 Referer 都不用）。所以：① 贴 pixiv 作品链接 → 先试官方接口，失败就自动改用反代（多图作品会把**每一页**逐页补齐）；② 另外注册了一个「Pixiv 搜图（免代理）」工具，群友说「来张初音ミク的图」时模型可以直接搜图 —— 搜到之后是**只下载**（默认，群里不发任何消息）、只发图还是图加说明，由「搜图结果怎么处理」那个设置决定。这也是本插件和「Pixiv 来张图（自建）」那个插件的重叠之处 —— 两者留一个就行。\n\n【发不出去的兜底】视频超过「视频转文件阈值」就改发**群文件**；压缩包超过「压缩包体积上限」就只回一行文字 + 本地路径；再失败（协议端不收、体积超限）也不会静默吞掉。\n\n【下载耗时】视频/图文需要几秒到几分钟（Pixiv、抖音、直播类要等内置浏览器渲染），这段时间不影响聊天：核心对链接转发是「发出去不等」的（app.js 里 forwardLinkedMedia(...).catch(...)），这里再自己串行排队 + 超时兜底，避免把机器和带宽压满。\n\n【去哪看产物】默认保存在 QQ Agent 的 data/video-downloader/ 下（按链接建子目录），可设保留天数自动清理。",
+  "author": "本地自建（按 QQ Agent 插件 API v1）",
+  "enabledByDefault": true,
+  "permissions": [],
+  "capabilities": ["media.download", "message.image-request"],
+  "requires": [],
+  "settings": {
+    "enabled": true,
+    "toolRoot": "",
+    "outDir": "",
+    "keepDays": 0,
+    "acceptLinks": "known+direct",
+    "proxy": "",
+    "allowLive": true,
+    "liveSeconds": 60,
+    "quality": "best",
+    "maxImages": 9,
+    "imageOverflow": "rest",
+    "zipMaxMb": 200,
+    "convertImages": "risky",
+    "searchEnabled": true,
+    "searchCount": 2,
+    "searchSendMode": "download",
+    "searchCommand": true,
+    "searchCommandMaxLen": 40,
+    "pixivAllowR18": false,
+    "videoAsFileMb": 100,
+    "concurrency": 1,
+    "timeoutSec": 300,
+    "notifyFailure": true,
+    "notifySuccess": false,
+    "extraArgs": ""
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用视频下载转发",
+      "description": "关掉后这个扩展提供的 media.download 能力立即失效：群里再出现链接也不会下载、不会发文件（核心连问都不会问它）。"
+    },
+    "toolRoot": {
+      "type": "string",
+      "label": "外部工具目录（留空 = 用内置的）",
+      "description": "**留空即可**：插件自带一份「肥鱼当劳」的基础版（只有命令行与下载引擎，不含界面），就在插件目录的 tool/ 下 —— 不依赖任何外部目录，QQ Agent 装到哪它就在哪跑。\n\n填了则改用那个目录作为工具根（必须能在那儿找到 src/cli.js），用于「想用另一份/更新版的工具」；曾经默认的 D:\\视频下载工具 视为「没填」，不会挡住内置的那份。\n\n工具的工作数据（yt-dlp/ffmpeg、下载历史、登录 Cookie）在 QQ Agent 的 data/video-downloader 下，跟这个路径无关。"
+    },
+    "outDir": {
+      "type": "string",
+      "label": "下载保存目录",
+      "description": "留空 = data/video-downloader/（QQ Agent 的数据目录，长期保留）。填绝对路径则存到那里。每次下载会按链接建一个子目录，避免同名互相覆盖。"
+    },
+    "keepDays": {
+      "type": "number",
+      "label": "产物保留天数",
+      "description": "0 = 永久保留（默认）。填 N（如 7）表示每次下载成功后，顺手删掉目录里超过 N 天的文件 —— 长期跑建议设一个，否则视频会把磁盘吃满。"
+    },
+    "acceptLinks": {
+      "type": "enum",
+      "label": "认领哪些链接",
+      "values": ["known", "known+direct", "all"],
+      "description": "known = 只认已知平台的链接（B站/抖音/YouTube/X/pixiv…），最安静；known+direct（默认）= 再加上像直链的地址（.mp4/.mkv/.m3u8/.mp3 这类）；all = 任何 http(s) 链接都试（群里贴个新闻链接也会去当视频下，噪音最大，慎用）。\n\n注意：核心会把同一条消息里的每个链接都问一遍所有提供者，「认领」意味着失败时会算在我们头上（可能往群里回一句失败说明）。所以默认不认领那些明显不是媒体的普通网页。"
+    },
+    "proxy": {
+      "type": "string",
+      "label": "代理地址（可选）",
+      "description": "填了就给下载工具加 --proxy http://127.0.0.1:7897（HTTP 代理，与工具界面里的「代理地址」是同一个东西）。\n\n**留空时**工具会自己跟随 Windows 系统代理（Clash/v2rayN 设的那个）—— 但系统代理开关在换节点/切模式时很容易被关掉，那时 pixiv 这类站点会突然全部失败，报的还是「直连超时」（看着像网络问题，其实是没有代理）。所以要么留空靠自动跟随，要么把这里填上固定走它。\n\n（B站/抖音/YouTube 这些不需要代理也能下；只有 pixiv、YouTube 部分内容才需要。）"
+    },
+    "allowLive": {
+      "type": "boolean",
+      "label": "允许处理直播链接",
+      "description": "开着（默认）：遇到直播页面/直播流，按下面的「直播最长录制秒数」录一小段发回。关掉：直播链接直接不认领（避免录个没完）。"
+    },
+    "liveSeconds": {
+      "type": "number",
+      "label": "直播最长录制秒数",
+      "description": "默认 60。直播链接会带上 --live --live-seconds 参数，到时自动结束并保存成可播放文件；填 0 = 只保存当前已发布的分片（更快，但不是完整一段）。"
+    },
+    "quality": {
+      "type": "enum",
+      "label": "清晰度",
+      "values": ["best", "2160", "1080", "720", "480", "worst", "audio"],
+      "description": "透传给下载工具的 -q。best = 最高画质（B站 1080P+ 需要工具那边登录过）；audio = 只要音频（会以文件形式发回）。群里转发建议 720 或 1080 —— 4K 视频动辄几百 MB，发不出去也占磁盘。"
+    },
+    "maxImages": {
+      "type": "number",
+      "label": "图文帖最多发几张图",
+      "description": "默认 9。抖音图文/Pixiv/B站专栏这类链接下下来的是图片，**先直接发这么多张**（防刷屏），多出来的按下面的「图片超出上限怎么办」处理 —— 默认打包成压缩包发，不会丢。设为 0 表示一张都不直接发（全走压缩包）。"
+    },
+    "imageOverflow": {
+      "type": "enum",
+      "label": "图片超出上限怎么办",
+      "values": ["rest", "all", "off"],
+      "description": "图比上面的张数多时：\n· rest（默认）= 前面 maxImages 张直接发在群里，**剩下的全部**打包成一个 zip 当群文件发；\n· all = 同样先发 maxImages 张，但 zip 里放**全部图片**（想要一份完整压缩包时用，会重复一份流量）；\n· off = 不打包，只发前面那些（其余留在本机，日志里会给路径）。\n\n压缩包用 Windows 自带的 tar.exe 打（Win10 1803+ 内置），失败自动换 PowerShell 的 Compress-Archive。压缩包名取帖子标题。发完压缩包会补一句一行说明，避免群友不知道这个 zip 是什么。"
+    },
+    "zipMaxMb": {
+      "type": "number",
+      "label": "压缩包体积上限（MB）",
+      "description": "默认 200。压缩包比这还大就不发文件了（群文件有上限，传上去也会失败），改成一行文字说明 + 本地路径。图多又都是大图时把「图文帖最多发几张」调大一些，或把这里调高。"
+    },
+    "convertImages": {
+      "type": "enum",
+      "label": "图片转成 jpg 再发",
+      "values": ["risky", "all", "off"],
+      "description": "B 站的图现在很多是 **avif**，而 QQ 图片消息基本只认 jpg/png/gif/bmp/webp（协议端的格式嗅探没有 avif 分支），直接发很可能失败。\n\n· risky（默认）= 只把 QQ 不认的格式（avif/heic/tiff/ico…）转成 jpg 再发；\n· all = 所有图都转 jpg（webp/png 也转）—— 如果你发现 webp 也发不出去就用这个；\n· off = 原样发。\n\n转换用「肥鱼当劳（ds-download）」自带 tools/ffmpeg.exe（没有就退回 PATH 里的 ffmpeg）。**动图（gif）永远不转会保留动画**；压缩包里始终是原图（zip 与格式无关）。"
+    },
+    "searchEnabled": {
+      "type": "boolean",
+      "label": "允许搜图（Pixiv）",
+      "description": "开着（默认）：模型多一个「Pixiv 搜图（免代理）」工具，群友说「来张初音ミク的图」这类要求时它会去搜图并下载。关掉：只保留「有人贴链接就自动下载转发」，模型看不到搜图工具。\n\n搜到之后发不发、发什么，由下面的「搜图结果怎么处理」决定（默认**只下载，群里不发消息**）。\n\n注意：如果你另外装了「Pixiv 来张图（自建）」插件，两个工具功能重叠 —— 建议只留一个（那个插件还能按会话设 R18 分级；本插件胜在**不需要代理**、多图作品会把每一页都补齐、图多时自动打包成压缩包）。"
+    },
+    "searchCount": {
+      "type": "number",
+      "label": "搜图默认下载几个作品",
+      "description": "默认 2（1~5）。模型也可以在调用时自己指定数量（对方说「多来几张」时它会把数量调大）。每个作品下到自己独立子目录，图多时按「图片超出上限怎么办」的规则发。"
+    },
+    "searchSendMode": {
+      "type": "enum",
+      "label": "搜图结果怎么处理",
+      "values": ["download", "images", "send"],
+      "description": "收到搜图命令、把图下下来之后怎么办：\n· download（默认）= **只下载**：图留在本机，群里一个字都不发（图也不发），下载情况写在控制台日志和工具返回值里，并明确要求模型也不要发言。适合「只想把图收下来、不想让机器人说话」；\n· images = **只发图**：图（超出上限照旧打包成 zip 当群文件）发到会话，但**不发任何文字**；\n· send = **图 + 两句固定话**：收到指令先发一句「开始搜图了」，图片发完再发一句「搜图结束了」，中间不再发「前 N 张发在上面了…」那种说明文字。想让人一眼看出「在搜了 / 搜完了」就用这个。\n\n**这两句由插件自己直接发**（走核心的发送管道：限频、去重、留档），不是让模型说话 —— 固定句式那条路上模型根本不会被叫醒；模型即使在别的路径里调了搜图工具，返回值里也会明确交代别自己再复述这两句。\n\n注意：这里只管**搜图**这条链路（链接自动转发不受影响）。"
+    },
+    "searchCommand": {
+      "type": "boolean",
+      "label": "确定性搜图指令（0 token）",
+      "description": "开着（默认）：群里出现这些**固定句式**时，插件直接搜图下载，**完全不叫醒模型**（省掉整轮对话的 token）：\n· 我要xxx的图 / 我要看xxx的图 / 我想看xxx的图\n· 来点xxx的图 / 来张xxx的图 / 来3张xxx的图 / 再给我来点xxx的图\n· 有没有xxx的图 / 有xxx的图吗 / 求xxx的图 / 搜点xxx的图\n· 给点xxx的图 / 给我几张xxx的图片 / 送我几张xxx的图片 / 再来一张xxx的图\n· 找与xxx相关的图片（xxx = 关键词；末尾必须是「图/图片」，开头必须命中上面那些触发词）\n\n关掉：这些句子照旧交给模型，由模型决定要不要调用搜图工具（会花 token，但什么话都能听懂）。\n\n实现方式：插件在运行时挂到核心的 Orchestrator.onIncoming（每条消息的必经点）上，命中就标已读并 veto —— **不用改核心文件、不用重启**，QQ Agent 升级也不会冲掉（本项目里「群打卡」「点歌」两个插件用的是同一条路）。\n\n刻意的保守：`刚刚那张图`、`我要这张图的出处`、`有没有什么好看的图`、`发现这张图拍得不错` 这类**不会**命中 —— 宁可漏给模型，也不能把群里的正常聊天当成搜图指令。"
+    },
+    "searchCommandMaxLen": {
+      "type": "number",
+      "label": "搜图指令的整句长度上限",
+      "description": "默认 40（字）。超过这个长度的消息哪怕是「我要…的图」也交给模型 —— 长句子里出现这个句式，多半是真的在说话，不是点图。想让机器人只听短指令就调小（如 20）。"
+    },
+    "pixivAllowR18": {
+      "type": "boolean",
+      "label": "允许成人向（Pixiv）",
+      "description": "默认关。**管两件事**：① 搜图时只出全年龄作品（会按作品标签二次筛 R-18 / R-18G）；② 有人贴了成人向作品链接时**不把图发到群里**（工具会在取图时顺带反查分级）。\n\n群里**强烈建议保持关闭** —— 这个开关没有按会话的管理员校验，打开就是全局生效。需要按会话分级的话用「Pixiv 来张图（自建）」那个插件（它有主人身份校验）。\n\n注意：反代那条路有时拿不到分级信息，这种情况下按全年龄处理（`pixivRating=0`），也就是说「默认关」并不能 100% 兜住所有成人向链接。"
+    },
+    "videoAsFileMb": {
+      "type": "number",
+      "label": "视频转文件阈值（MB）",
+      "description": "默认 100。视频文件超过这个大小就不发「视频」消息（QQ 对视频有时长/体积限制，超了会发失败），改发**群文件**；群文件也发不出去时回一句文字说明 + 本地路径。"
+    },
+    "concurrency": {
+      "type": "number",
+      "label": "同时下载数",
+      "description": "默认 1（一次只下一个）。下载很吃带宽与磁盘，群里连着贴几个链接时串行更稳；设 2~3 可以快一点，但更容易触发站点风控。"
+    },
+    "timeoutSec": {
+      "type": "number",
+      "label": "单次下载超时（秒）",
+      "description": "默认 300。到点会连同子进程树一起结束（Windows 下用 taskkill /T），并在日志里说明是超时 —— 不然一个卡住的下载会永远占着队列。"
+    },
+    "notifyFailure": {
+      "type": "boolean",
+      "label": "失败时在群里说一句",
+      "description": "开着（默认）：认领了但下载失败时，回一句简短说明（如「这个视频需要登录后才能下」），避免群友以为机器人死了。关掉：只写日志，群里完全安静。"
+    },
+    "notifySuccess": {
+      "type": "boolean",
+      "label": "成功时也报一句",
+      "description": "默认关。开着会在发视频前先说一句「在下，稍等」，下载完再发文件 —— 慢的时候体验更好，但会多两条消息。"
+    },
+    "extraArgs": {
+      "type": "string",
+      "label": "附加命令行参数（高级）",
+      "description": "追加给下载工具的参数，空格分隔。例如 --codec hevc（省体积）或 --no-browser-assist（关掉内置浏览器兜底）。留空即默认行为。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "video-downloader-note",
+        "title": "视频下载转发（自动）",
+        "priority": 60,
+        "content": "群里有人贴出视频/图文链接时，本机装了一个「视频下载」插件会**自动**把内容下下来并发到群里 —— 这件事不需要你决定，也不经过你。\n\n所以：① 不要声称「我帮你下载了」或预告下载进度（你看不到它的队列），更不要假装自己会下载；② 如果对方问「下了吗」，就说这是本地工具在处理、稍等，别提技术细节；③ 对方给了链接但你看到已经自动发了文件，正常接着聊就行。有人贴的链接不属于支持的平台（比如普通新闻页）时不会被下载，需要的话如实说这个链接不支持。\n\n图文帖（图片多的那种）会**前几张直接发图、其余打包成一个压缩包一起发**，这是插件按防刷屏规则自动决定的，不用你解释成「我压缩的」。"
+      },
+      {
+        "id": "video-downloader-pixiv-search",
+        "title": "Pixiv 搜图（按需调用）",
+        "priority": 58,
+        "content": "有人**明确要图**时（「来张初音ミク的图」「搜点猫娘的图」「有没有 XX 的壁纸」），调 `video-downloader__pixiv_search`（参数 keyword，可带 count 1~5，默认 2）—— 它会搜 Pixiv 并把图直接发到当前会话，**不需要代理**。\n\n分寸：① 只有对方明确要图才用，别主动发；② 对方追问「还有吗/再来几张」时再调一次（可以换个关键词）；③ 发完不要描述图里画了什么，也不要汇报「已发送」；④ 工具报错（搜不到/取图失败）就如实说这次没取到，别自己编图；⑤ 图片多的时候插件会自动把超出上限的部分打包成压缩包，不用你解释。"
+      }
+    ]
+  }
+}

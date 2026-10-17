@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>懒加载长图集测试页（模仿 B 站 opus / 专栏）</title>
+    <style>
+      body { font-family: sans-serif; margin: 0; }
+      .row { min-height: 700px; padding: 8px; }
+      img { display: block; width: 600px; height: 400px; background: #eee; margin: 8px 0; }
+    </style>
+  </head>
+  <body>
+    <div id="list"></div>
+    <script>
+      // 模仿真实页面：图片不是一次性都在 DOM 里，而是滚动到附近才被挂上去（虚拟列表 + 懒加载）
+      const CONTENT_COUNT = 130;
+      const base = 'https://i0.hdslb.com/bfs/article/';
+      const list = document.getElementById('list');
+      let appended = 0;
+
+      // 干扰项：头像、前端静态资源、正文图的 128w 缩略变体 —— 都不该被当成正文图
+      function appendJunk() {
+        const junk = [
+          'https://i1.hdslb.com/bfs/face/f028fa152b628afd3e92bdb37075c0538f00ddf4.jpg@120w_120',
+          'https://i0.hdslb.com/bfs/garb/open/28bbc9b9ad59d3177c7db47221d9d4ffe7e2a1a5.png',
+          'https://s1.hdslb.com/bfs/static/jinkela/long/bmg/register/cmpt.js',
+          'https://s1.hdslb.com/bfs/seed/jinkela/short/bili-theme/map.css',
+          'https://i0.hdslb.com/bfs/svg-next/BDC/emoji_circle_line/v1.json',
+        ];
+        for (const url of junk) {
+          const img = document.createElement('img');
+          img.src = url;
+          list.appendChild(img);
+        }
+        // 正文图的缩略变体（同一张图，应被归并掉）
+        for (let i = 0; i < 5; i += 1) {
+          const img = document.createElement('img');
+          img.src = `${base}p${i}.png@128w_128h_1c_!web-dynamic.webp`;
+          list.appendChild(img);
+        }
+      }
+
+      function appendBatch() {
+        const frag = document.createDocumentFragment();
+        for (let i = appended; i < Math.min(appended + 8, CONTENT_COUNT); i += 1) {
+          const img = document.createElement('img');
+          img.src = `${base}p${i}.png@1192w.webp`;
+          img.setAttribute('data-index', String(i));
+          frag.appendChild(img);
+        }
+        appended = Math.min(appended + 8, CONTENT_COUNT);
+        list.appendChild(frag);
+      }
+
+      appendJunk();
+      appendBatch();
+
+      // 滚到底部就继续加载下一批，直到全部加载完
+      window.addEventListener('scroll', () => {
+        const nearBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 400;
+        if (nearBottom && appended < CONTENT_COUNT) appendBatch();
+      });
+      window.__APPENDED = () => appended;
+    </script>
+  </body>
+</html>

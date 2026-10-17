@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;" />
+    <title>肥鱼当劳</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img class="logo" src="logo.png" alt="肥鱼当劳" width="40" height="40" />
+        <div>
+          <h1>肥鱼当劳</h1>
+          <p class="sub">ds-download · 直链 · HLS(m3u8) · 各类视频站点<span id="version"></span></p>
+        </div>
+      </div>
+      <div class="tools">
+        <div class="chip" id="chip-login" title="用内置浏览器登录站点，之后即可下载高画质 / 会员内容">
+          <span class="dot" id="dot-login"></span>
+          <span class="chip-label">登录</span>
+          <span class="chip-value" id="login-value">未登录</span>
+          <button class="mini" id="btn-login">登录</button>
+          <button class="mini" id="btn-logout" hidden>退出</button>
+        </div>
+        <div class="chip" id="chip-ytdlp" title="站点解析引擎">
+          <span class="dot" id="dot-ytdlp"></span>
+          <span class="chip-label">yt-dlp</span>
+          <span class="chip-value" id="ytdlp-value">检测中…</span>
+          <button class="mini" id="btn-get-ytdlp">获取</button>
+        </div>
+        <div class="chip" id="chip-ffmpeg" title="用于合并音视频 / 转封装 MP4">
+          <span class="dot" id="dot-ffmpeg"></span>
+          <span class="chip-label">ffmpeg</span>
+          <span class="chip-value" id="ffmpeg-value">检测中…</span>
+          <button class="mini" id="btn-get-ffmpeg">获取</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="setup-bar" id="setup-bar" hidden>
+      <span id="setup-label">准备中…</span>
+      <div class="bar"><div class="bar-fill" id="setup-fill"></div></div>
+      <span id="setup-text"></span>
+    </div>
+
+    <main class="layout">
+      <section class="card input-card">
+        <div class="dropzone" id="dropzone">
+          <textarea
+            id="url-input"
+            rows="3"
+            spellcheck="false"
+            placeholder="粘贴视频链接，支持多个（每行一个），也可以直接把链接拖进这个窗口&#10;例如：&#10;https://www.example.com/video.mp4&#10;https://www.example.com/master.m3u8&#10;https://www.bilibili.com/video/BVxxxxxxxx"
+          ></textarea>
+          <div class="row">
+            <button class="primary" id="btn-download">开始下载</button>
+            <button class="ghost" id="btn-parse">解析链接</button>
+            <button class="ghost" id="btn-clear-input" title="一键清空输入栏（Ctrl+Shift+X）">清空</button>
+            <button class="ghost danger" id="btn-cancel-all">全部取消</button>
+            <span class="spacer"></span>
+            <span class="hint" id="queue-hint"></span>
+          </div>
+        </div>
+
+        <div class="pixiv-search" id="pixiv-search-box">
+          <div class="ps-title">Pixiv 搜图 <span class="hint">（走公开检索接口 + pixiv.re 反代，<b>不需要代理</b>）</span></div>
+          <div class="row">
+            <input type="text" id="pixiv-keyword" placeholder="角色名 / 关键词，如 初音ミク、猫娘、风景" spellcheck="false" />
+            <label class="ps-count" title="下载几个作品">
+              <span>数量</span>
+              <input type="number" id="pixiv-count" min="1" max="20" value="3" />
+            </label>
+            <label class="check ps-r18" title="允许成人向作品（R-18 / R-18G）">
+              <input type="checkbox" id="pixiv-r18" />
+              <span>允许 R18</span>
+            </label>
+            <button class="primary" id="btn-pixiv-search">搜图并下载</button>
+            <button class="ghost" id="btn-pixiv-list">只列出</button>
+          </div>
+          <div class="ps-status hint" id="pixiv-status"></div>
+          <div class="ps-results" id="pixiv-results" hidden></div>
+        </div>
+
+        <details class="options" id="options">
+          <summary>下载选项</summary>
+          <div class="grid">
+            <label class="field wide">
+              <span>保存目录</span>
+              <div class="with-buttons">
+                <input type="text" id="out-dir" readonly />
+                <button class="ghost" id="btn-pick-dir">选择…</button>
+                <button class="ghost" id="btn-open-dir">打开</button>
+              </div>
+            </label>
+
+            <label class="field">
+              <span>清晰度</span>
+              <select id="quality">
+                <option value="best">最佳画质</option>
+                <option value="2160">2160P / 4K</option>
+                <option value="1440">1440P / 2K</option>
+                <option value="1080">1080P</option>
+                <option value="720">720P</option>
+                <option value="480">480P</option>
+                <option value="360">360P</option>
+                <option value="worst">最低画质</option>
+                <option value="audio">仅音频</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>编码偏好</span>
+              <select id="codec">
+                <option value="h264">H.264（兼容性最好）</option>
+                <option value="hevc">H.265 / HEVC</option>
+                <option value="av1">AV1（体积最小）</option>
+                <option value="best">让 yt-dlp 决定（画质优先）</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>解析引擎</span>
+              <select id="engine">
+                <option value="auto">自动</option>
+                <option value="builtin">内置（直链 / m3u8）</option>
+                <option value="ytdlp">yt-dlp（站点）</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>分片并发</span>
+              <input type="number" id="concurrency" min="1" max="16" step="1" />
+            </label>
+
+            <label class="field">
+              <span>同时下载任务数</span>
+              <input type="number" id="parallel" min="1" max="6" step="1" />
+            </label>
+
+            <label class="field">
+              <span>Cookie 文件</span>
+              <div class="with-buttons">
+                <input type="text" id="cookies-file" placeholder="cookies.txt（可选）" />
+                <button class="ghost" id="btn-pick-cookies">选择…</button>
+              </div>
+            </label>
+
+            <label class="field">
+              <span>从浏览器读取 Cookie</span>
+              <select id="cookies-browser">
+                <option value="">不使用</option>
+                <option value="chrome">Chrome</option>
+                <option value="edge">Edge</option>
+                <option value="firefox">Firefox</option>
+                <option value="brave">Brave</option>
+                <option value="chromium">Chromium</option>
+              </select>
+            </label>
+
+            <div class="field">
+              <span>代理地址</span>
+              <div class="field-row">
+                <input type="text" id="proxy" placeholder="留空 = 自动跟随系统代理（Clash/v2rayN 那个）" />
+                <button id="btn-proxy-test" class="ghost mini" type="button" title="立即生效，无需重启">测试代理</button>
+              </div>
+              <small id="proxy-status" class="hint"></small>
+            </div>
+
+            <label class="check">
+              <input type="checkbox" id="overwrite" />
+              <span>覆盖同名文件</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="live" />
+              <span>直播流持续录制（不加则只存当前分片）</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="auto-ytdlp" />
+              <span>缺少 yt-dlp 时自动获取</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="auto-ffmpeg" />
+              <span>需要合并音视频时自动获取 ffmpeg（约 30MB）</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="browser-assist" />
+              <span>解析不了时用内置浏览器渲染页面抓视频（抖音等）</span>
+            </label>
+          </div>
+        </details>
+
+        <div class="probe" id="probe-result" hidden></div>
+      </section>
+
+      <section class="card tasks-card">
+        <div class="card-head">
+          <h2>下载任务 <span class="counter" id="task-counter">0</span></h2>
+          <div class="head-actions">
+            <button class="ghost" id="btn-clear-done">清除已完成</button>
+          </div>
+        </div>
+        <div class="tasks" id="tasks">
+          <div class="empty" id="tasks-empty">
+            <p>还没有任务</p>
+            <p class="small">在上方粘贴链接后点击「开始下载」，或直接拖拽链接到窗口</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="card history-card">
+        <div class="card-head">
+          <h2>下载历史 <span class="counter" id="history-counter">0</span></h2>
+          <div class="head-actions">
+            <label class="inline-field" title="保留并显示的记录条数（修改后会立即按此条数裁剪已有历史）">
+              <span>显示条数</span>
+              <input type="number" id="history-limit" min="1" max="2000" step="1" value="20" />
+            </label>
+            <button class="ghost" id="btn-history-refresh">刷新</button>
+            <button class="ghost danger" id="btn-history-clear">清空历史</button>
+          </div>
+        </div>
+        <div class="history-list" id="history-list">
+          <div class="empty"><p class="small">还没有下载记录</p></div>
+        </div>
+      </section>
+
+      <section class="card log-card">
+        <div class="card-head">
+          <h2>运行日志</h2>
+          <div class="head-actions">
+            <button class="ghost" id="btn-toggle-log">折叠</button>
+            <button class="ghost" id="btn-clear-log">清空</button>
+          </div>
+        </div>
+        <pre class="log" id="log"></pre>
+      </section>
+    </main>
+
+    <div class="modal" id="login-modal" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <h3>登录站点</h3>
+          <button class="mini" id="btn-login-close">关闭</button>
+        </div>
+        <p class="modal-hint">
+          用内置浏览器打开站点登录页（扫码或账号密码都行），<b>登录完成后关闭那个窗口</b>即可。登录状态会一直保留，
+          可以逐个登录多个站点、互不影响；下载时会自动带上对应站点的登录状态。
+        </p>
+        <div class="site-grid" id="login-site-grid"></div>
+        <label class="field">
+          <span>或者其他任意网站（填网址或域名）</span>
+          <input type="text" id="login-custom" placeholder="例如 https://www.example.com/ 或 example.com" />
+        </label>
+        <div class="modal-actions">
+          <button class="primary" id="btn-login-go">打开登录窗口</button>
+          <span class="spacer"></span>
+          <span class="hint" id="login-current"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>图文帖轮播测试页（模仿抖音图片播放器）</title>
+    <style>
+      body { font-family: sans-serif; }
+      .slide { width: 600px; }
+    </style>
+  </head>
+  <body>
+    <main data-e2e="note-detail">
+      <div class="player">
+        <img id="slide" class="slide" alt="slide" />
+        <div id="next" data-e2e="video-switch-next-arrow" role="button">下一张</div>
+      </div>
+      <div data-e2e="comment-list">
+        <div data-e2e="comment-item"><img id="comment" alt="comment" /></div>
+      </div>
+    </main>
+    <script>
+      // 模仿真实页面：DOM 里只有「当前这一张」，翻页才换成下一张；到末页时按钮置灰
+      const SLIDES = [
+        'https://p3-pig.douyinpic.com/tos-cn-i-0813/slide1~tplv-dy-aweme-images-v2:3000:3000:q75.jpeg?biz_tag=aweme_images',
+        'https://p3-pig.douyinpic.com/tos-cn-i-0813/slide2~tplv-dy-aweme-images-v2:3000:3000:q75.jpeg?biz_tag=aweme_images',
+        'https://p3-pig.douyinpic.com/tos-cn-i-0813/slide3~tplv-dy-aweme-images-v2:3000:3000:q75.jpeg?biz_tag=aweme_images',
+      ];
+      const img = document.getElementById('slide');
+      const next = document.getElementById('next');
+      let index = 0;
+      const render = () => {
+        img.src = SLIDES[index];
+        next.className = index >= SLIDES.length - 1 ? 'disabled' : '';
+      };
+      next.addEventListener('click', () => {
+        if (index < SLIDES.length - 1) {
+          index += 1;
+          render();
+        }
+      });
+      // 评论区的图不该被当成正文图
+      document.getElementById('comment').src =
+        'https://p3-pig.douyinpic.com/obj/tos-cn-i-tsj2vxp0zn/deadbeef?biz_tag=aweme_comment';
+      render();
+      window.__READY = true;
+    </script>
+  </body>
+</html>

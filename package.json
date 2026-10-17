@@ -1,0 +1,36 @@
+{
+  "name": "ds-download",
+  "version": "1.0.0",
+  "private": true,
+  "description": "肥鱼当劳（ds-download）：本地视频下载工具，支持直链视频、HLS(m3u8) 流，以及 yt-dlp 覆盖的各类站点；命令行与 Electron 桌面界面共用同一套引擎。",
+  "main": "src/gui/main.js",
+  "bin": {
+    "ds-download": "src/cli.js",
+    "dsdl": "src/cli.js",
+    "vgrab": "src/cli.js",
+    "video-dl": "src/cli.js"
+  },
+  "scripts": {
+    "cli": "node src/cli.js",
+    "gui": "electron .",
+    "start": "electron .",
+    "icon": "node build/make-icon.mjs",
+    "icon:from": "electron build/icon-from-image.cjs --from",
+    "logo:from": "electron build/make-logo.cjs --from",
+    "package": "node build/build-package.mjs",
+    "package:dir": "node build/build-package.mjs --no-zip",
+    "package:shortcut": "node build/build-package.mjs --shortcut",
+    "package:noicon": "node build/build-package.mjs --no-rcedit",
+    "selftest": "electron . --selftest",
+    "test": "node tests/run.js",
+    "test:net": "node tests/smoke-network.js",
+    "test:pages": "node tests/page-slides.js && node tests/page-gallery.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "electron": "^38.2.0",
+    "rcedit": "^5.0.1"
+  }
+}
