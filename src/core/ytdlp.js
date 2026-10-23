@@ -344,6 +344,39 @@ function probeBinary(binPath, arg = '-version') {
 }
 
 /**
+ * 这个媒体文件里**有没有音轨**（2026-10-23）。
+ *
+ * 用 `ffmpeg -i <file>` 的 stderr 里有没有 `Audio:` 来判断 —— ffmpeg 只读不转，
+ * 几毫秒就返回；没有 ffmpeg 就返回 `null`（表示"不知道"，调用方不要当成没有）。
+ * @returns {Promise<boolean|null>}
+ */
+function mediaHasAudio(ffmpegPath, filePath) {
+  if (!ffmpegPath || !fileExists(filePath)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(ffmpegPath, ['-hide_banner', '-i', filePath], { windowsHide: true });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let out = '';
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* ignore */ }
+      resolve(null);
+    }, 15000);
+    child.stdout?.on('data', (d) => { out += d.toString(); });
+    child.stderr?.on('data', (d) => { out += d.toString(); if (out.length > 20000) out = out.slice(-20000); });
+    child.on('error', () => { clearTimeout(timer); resolve(null); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      if (!/Input #0/i.test(out)) { resolve(null); return; }   // 打不开/不是媒体 → 不判断
+      resolve(/Stream #\d+:\d+.*: Audio:/i.test(out));
+    });
+  });
+}
+
+/**
  * 获取 ffmpeg：依次尝试多个源，遇到 404 / 解压失败 / 速度过慢会自动换下一个源。
  */
 async function downloadFfmpeg({ toolsDir, onProgress, signal, logger = () => {} }) {
@@ -644,9 +677,15 @@ function buildFormatSelector(quality, { hasFfmpeg, audioOnly } = {}) {
     if (h > 0) return `b[height<=${h}][ext=mp4]/b[height<=${h}]/b[ext=mp4]/b`;
     return 'b[ext=mp4]/b';
   }
-  if (quality === 'worst') return 'wv*+wa/w';
-  if (h > 0) return `bv*[height<=${h}]+ba/b[height<=${h}]/bv*+ba/b`;
-  return 'bv*+ba/b';
+  /**
+   * ⚠️ 必须保证"带音轨"（2026-10-23 用户报小红书没声音）：
+   * `bv*+ba/b` 在"站点只给合体格式"时没问题，但小红书这类站点有时会给出**纯视频流**，
+   * `bv*` 一旦恰好是它，合出来就是无声视频。所以选择器里显式要求 `acodec!=none`，
+   * 下完还有一道`mediaHasAudio()`复检兜底。
+   */
+  if (quality === 'worst') return 'wv*+wa/w[acodec!=none]/w';
+  if (h > 0) return `bv*[height<=${h}]+ba/b[height<=${h}][acodec!=none]/b[height<=${h}]/bv*+ba/b`;
+  return 'bv*+ba/b[acodec!=none]/b';
 }
 
 /**
@@ -861,6 +900,41 @@ async function downloadWithYtDlp(opts) {
   }
   if (!finalPath) throw new Error('yt-dlp 已完成，但没能确定输出文件位置（可尝试 --engine builtin 或查看日志）');
   if (!fileExists(finalPath)) throw new Error(`yt-dlp 报告的输出文件不存在：${JSON.stringify(finalPath)}`);
+  /**
+   * 有道「无声视频」的保险（2026-10-23 用户报：小红书下载下来没有声音）。
+   *
+   * 现场：同一条小红书链接，`-f 6`（hevc+aac）下出来是有声音的，
+   * 但用户那次拿到的文件比正常版小了一整条音轨（5,021,869 vs 5,394,682 字节）——
+   * 也就是**选到了纯视频轨**（小红书/部分站点的 `bv*` 就是无音轨的）。
+   * 因为选流还受清晰度/编码偏好/站点返回的影响，光靠格式选择器不能保证，
+   * 所以下完**验一遍有没有音轨**：没有就自动用「必须带音频」的选择器重下一次。
+   */
+  if (!audioOnly && finalPath && /\.(mp4|mkv|webm|mov|flv|ts|m4v)$/i.test(finalPath)) {
+    let hasAudio = null;
+    try {
+      hasAudio = await mediaHasAudio(ffmpegPath, finalPath);
+    } catch {
+      hasAudio = null;   // 探测失败就当"不知道"，不要因此打断正常下载
+    }
+    if (hasAudio === false) {
+      logger('⚠ 这个文件没有音轨（选到了纯视频流），正在用「必须带音频」的方式重新下载一次…', { notice: true });
+      const retryArgs = buildArgs().args;
+      // 把 -f <selector> 换成"优先带音频的合体格式 → 否则视频+音频合并"
+      const idx = retryArgs.indexOf('-f');
+      if (idx >= 0 && retryArgs[idx + 1]) retryArgs[idx + 1] = 'b[acodec!=none]/bv*+ba/b';
+      else retryArgs.push('-f', 'b[acodec!=none]/bv*+ba/b');
+      finalPath = '';
+      const retry = await runYtDlp(bin, retryArgs, { onLine: parseLine, signal, logger });
+      if (retry.code === 0 && finalPath && fileExists(finalPath)) {
+        const again = await mediaHasAudio(ffmpegPath, finalPath).catch(() => null);
+        logger(again ? '✔ 重新下载完成，这次带音轨了' : '⚠ 重新下载完成，但仍然没有音轨（可能是源本身就没有声音）', { notice: true });
+      } else {
+        const produced = findRecentMediaFile(outDir, startTime);
+        if (produced) finalPath = produced;
+        logger('重新下载没有成功，保留第一次的文件', { notice: true });
+      }
+    }
+  }
   if (onProgress) onProgress(meter.snapshot({ done: true, label: path.basename(finalPath) }));
   return { filePath: finalPath, bytes: fileSize(finalPath), engine: 'ytdlp' };
 }
@@ -877,6 +951,7 @@ module.exports = {
   runYtDlp,
   decodeChunk,
   probeBinary,
+  mediaHasAudio,
   FFMPEG_SOURCES,
   ytDlpVersion,
   getStreamInfo,

@@ -120,7 +120,12 @@ async function cardSegmentText(seg) {
   const type = String(seg?.type ?? '').toLowerCase();
   const placeholder = type === 'json' ? '[卡片消息]' : \`[\${type || '未知'}]\`;
   try {
-    const mod = await import('${PLUGIN_MODULE_REL}');
+    // ⚠️ 带 cache-bust：模块 URL 不带查询串时，ESM 注册表会一直返回进程**最早**加载的那份，
+    // 改了 card-links.mjs 也不会生效（只能重启 QQ Agent）—— 同一类"静默跑旧代码"的坑。
+    // 用「分钟」做桶：刷新最多延迟一分钟，又不会每条卡片消息都新建一个模块实例。
+    const url = new URL('${PLUGIN_MODULE_REL}', import.meta.url);
+    url.searchParams.set('v', String(Math.floor(Date.now() / 60000)));
+    const mod = await import(url.href);
     return await mod.cardSegmentToText(seg);
   } catch (error) {
     console.error('[card-links] 卡片转译失败，退回占位符：', error?.message ?? error);

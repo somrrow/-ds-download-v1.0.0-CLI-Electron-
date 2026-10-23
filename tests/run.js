@@ -550,8 +550,8 @@ const tests = [
   test('yt-dlp 选流表达式与报错翻译', () => {
     // 没有 ffmpeg 时只能选“已合体”的格式，避免 Requested format is not available
     assertEqual(buildFormatSelector('best', { hasFfmpeg: false }), 'b[ext=mp4]/b');
-    assertEqual(buildFormatSelector('best', { hasFfmpeg: true }), 'bv*+ba/b');
-    assertEqual(buildFormatSelector('720', { hasFfmpeg: true }), 'bv*[height<=720]+ba/b[height<=720]/bv*+ba/b');
+    assertEqual(buildFormatSelector('best', { hasFfmpeg: true }), 'bv*+ba/b[acodec!=none]/b');
+    assertEqual(buildFormatSelector('720', { hasFfmpeg: true }), 'bv*[height<=720]+ba/b[height<=720][acodec!=none]/b[height<=720]/bv*+ba/b');
     assertEqual(buildFormatSelector('720', { hasFfmpeg: false }), 'b[height<=720][ext=mp4]/b[height<=720]/b[ext=mp4]/b');
     assertEqual(buildFormatSelector('audio', { hasFfmpeg: true }), 'bestaudio/best');
 

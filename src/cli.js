@@ -37,6 +37,26 @@ const {
  * 代理来源优先级：--proxy 参数 → 环境变量（HTTPS_PROXY 等）→ Windows 系统代理。
  * 系统代理这一项很关键：浏览器能打开 pixiv 靠的就是它，Node 自带的 fetch 完全不认。
  */
+/**
+ * 当前**实际生效**的代理（命令参数 > 环境变量 > 系统代理），没配就返回空。
+ * 给失败文案用：让群友一眼看出"是代理没配"还是"代理配了但不通"。
+ */
+function currentProxyLabel() {
+  try {
+    const flagIndex = process.argv.indexOf('--proxy');
+    const flagProxy = flagIndex >= 0 && flagIndex + 1 < process.argv.length ? process.argv[flagIndex + 1] : '';
+    const explicit = String(flagProxy || '').trim();
+    if (explicit) return explicit;
+    const fromEnv = String(envProxyUrl() || '').trim();
+    if (fromEnv) return `${fromEnv}（环境变量）`;
+    const fromSystem = String(systemProxyUrl() || '').trim();
+    if (fromSystem) return `${fromSystem}（系统代理）`;
+  } catch {
+    /* 探测失败就当没有 */
+  }
+  return '无';
+}
+
 function ensureProxySupport() {
   const flagIndex = process.argv.indexOf('--proxy');
   const flagProxy = flagIndex >= 0 && flagIndex + 1 < process.argv.length ? process.argv[flagIndex + 1] : '';
@@ -97,7 +117,14 @@ const HELP = `
       --doctor              检查 yt-dlp / ffmpeg / 网络环境
       --check-proxy         代理自检：分别用直连与代理探测几个站点，给出明确结论
       --pixiv-search <关键词> 搜 Pixiv 插画并下载（用公开检索接口 + pixiv.re 反代，**不需要代理**）
-      --count <数量>         搜索时下载几个作品（默认 3，最多 20；注意不是 -n，-n 是 --name）
+                             ⚠️ 配了代理时：公开接口和反代**仍然直连**（不受代理影响），
+                             只有下面那个「原生搜索」兜底会走代理
+                             没搜到会自动改用 Pixiv 原生搜索（那一步需要能连上 pixiv.net）
+      --no-pixiv-native      关掉上面的原生搜索兜底
+      --pixiv-node-failover  原生搜索被代理重置时，自动切到「能连 pixiv」的节点再试一次
+                             （会改 Clash 代理组的选择，默认关）
+      --count <数量>         搜索时下载几个作品（默认 3，**没有硬上限**；不是 -n，-n 是 --name）
+      --exclude-pids <pids>  已经发过的作品 pid（逗号分隔），搜图时跳过（插件自动传）
       --r18                 搜索时允许成人向作品（默认只出全年龄；群聊里别开）
       --list-only           只列出搜索结果，不下载
       --pixiv-source <来源>  Pixiv 取图来源：auto（默认，先官方接口再自动退回反代）/ api / mirror
@@ -255,11 +282,28 @@ function parseArgs(argv) {
       case '--pixiv-source':
         opts.pixivSource = need(i, a);
         break;
+      case '--pixiv-node-failover':
+        // 原生搜索被代理重置时，自动把 Clash 代理组切到一个「能连 pixiv」的节点，然后重试一次。
+        // 会改 Clash 的组选择（MATCH,✈️Final 影响所有走代理的流量），所以默认关、要显式开。
+        opts.pixivNodeFailover = true;
+        break;
+      case '--exclude-pids':
+        // 已经发过的作品 pid（逗号分隔）：搜图时跳过，避免同一张图发第二遍（2026-10-20）
+        opts.excludePids = String(need(i, a) || '')
+          .split(',')
+          .map((x) => x.trim())
+          .filter((x) => /^\d+$/.test(x));
+        break;
+      case '--no-pixiv-native':
+        // 关掉「没搜到就改用 Pixiv 原生搜索」的兜底（原生搜索那一步要能连上 pixiv.net）
+        opts.nativeFallback = false;
+        break;
       case '--count': {
         // ⚠️ 注意：`-n` 在这个工具里早就是 `--name`（输出文件名）的短选项，
         // 所以条数只能用长选项 `--count`，别再给 `-n` 加第二种含义（踩过：
         // `-n 2` 被当成文件名"2"，搜出来的图全叫 2.png / 2 (1).png）。
-        opts.count = Math.max(1, Number(need(i, a)) || 1);
+        // 2026-10-20：数量**不再卡 20**（用户要求：每次搜图没有硬上限），只留 500 的天窗。
+        opts.count = Math.max(1, Math.min(500, Number(need(i, a)) || 1));
         break;
       }
       case '--r18':
@@ -814,16 +858,25 @@ async function runPixivSearch(downloader, opts = {}) {
   const { formatBytes } = require('./core/util');
 
   const keyword = String(opts.pixivSearch || '').trim();
-  const count = Math.max(1, Math.min(20, Number(opts.count) || 3));
+  // 2026-10-20：数量不再卡 20（用户要求没有硬上限），只留 500 的天窗
+  const count = Math.max(1, Math.min(500, Number(opts.count) || 3));
   const outDir = opts.outDir || downloader.options.outDir;
 
   process.stdout.write(
-    `ⓘ 搜索 Pixiv：${keyword}（最多 ${count} 个作品${opts.allowR18 ? '，含成人向' : '，只要全年龄'}；走反代，不需要代理）\n`,
+    `ⓘ 搜索 Pixiv：${keyword}（最多 ${count} 个作品${opts.allowR18 ? '，含成人向' : '，只要全年龄'}；` +
+      `公开接口 + 反代，没搜到会自动改用 Pixiv 原生搜索${opts.nativeFallback === false ? '（已用 --no-pixiv-native 关掉）' : ''}）\n`,
   );
 
   // 命令行与桌面界面共用同一个实现（src/core/pixiv.js 的 searchAndDownloadPixiv）
   const out = await searchAndDownloadPixiv(keyword, {
     count,
+    // 免代理接口没搜到 → 自动改用 Pixiv 原生搜索（需要能连上 pixiv.net）；
+    // `--no-pixiv-native` 可以关掉这条兜底
+    nativeFallback: opts.nativeFallback !== false,
+    // 节点自救（默认关）：`--pixiv-node-failover` 或 VIDEOGRAB_PIXIV_FAILOVER=1
+    pixivNodeFailover: Boolean(opts.pixivNodeFailover),
+    // 已经发过的 pid：搜图时直接跳过（2026-10-20，插件会传进来）
+    excludePids: Array.isArray(opts.excludePids) ? opts.excludePids : [],
     allowR18: Boolean(opts.allowR18),
     listOnly: Boolean(opts.listOnly),
     outDir,
@@ -836,7 +889,14 @@ async function runPixivSearch(downloader, opts = {}) {
   });
 
   if (!out.items.length) {
-    process.stderr.write(`✖ 没有搜到作品${out.errors.length ? `（${out.errors.join('；')}）` : ''}\n`);
+    /**
+     * 失败文案要能**直接指导下一步**（2026-10-19 现场）：
+     * 群里回了一句"代理可能没生效"，可当时**根本没配代理** —— 真正的原因是
+     * 「高松灯」这个简体写法在 pixiv 上没有对应标签（换成繁体「高松燈」立刻就有）。
+     * 所以这里把"当前代理有没有"写进错误里，插件据此给不同的话，不再一律怪代理。
+     */
+    const proxy = currentProxyLabel();
+    process.stderr.write(`✖ 没有搜到作品${out.errors.length ? `（${out.errors.join('；')}）` : ''}｜当前代理：${proxy}\n`);
     return 1;
   }
   process.stdout.write(`ⓘ 命中 ${out.items.length} 个（来源 ${out.backend}）\n`);
@@ -871,11 +931,31 @@ async function runPixivSearch(downloader, opts = {}) {
 if (require.main === module) {
   ensureProxySupport();
 
+  /**
+   * "静默退出"兜底（2026-10-18 真实现场）：
+   *
+   * 如果某个 await 永远不会返回（代理隧道半死、底层 fetch 不理会 abort），
+   * 定时器烧完之后事件循环里就没有 handle 了 —— Node 会**直接以退出码 0 结束**，
+   * 一行错误都不打。上层只能看到"搜图工具退出码 0，且没有产出任何文件"，
+   * 根本查不出原因（搜图"只打了两行横幅就没下文"就是这么来的）。
+   *
+   * `beforeExit` 在"事件循环空了但还没退"时触发：这里一旦发现 main() 没结算，
+   * 就明确报错并置 1，绝不让它伪装成成功。
+   */
+  let settled = false;
+  process.on('beforeExit', () => {
+    if (settled) return;
+    process.stderr.write('运行没有正常结束：有请求始终没有返回（多半是代理隧道卡住），已按失败处理\n');
+    process.exitCode = 1;
+  });
+
   main()
     .then((code) => {
+      settled = true;
       process.exitCode = code;
     })
     .catch((err) => {
+      settled = true;
       process.stderr.write(`运行出错：${err && err.stack ? err.stack : err}\n`);
       process.exitCode = 1;
     });

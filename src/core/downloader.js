@@ -14,10 +14,11 @@
 const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 
 const { probe, buildFilename, normalizeUrl, isYtDlpPlatform } = require('./probe');
 const { downloadDirect } = require('./downloads/direct');
-const { downloadHls, resolveMediaPlaylist, muxWithFfmpeg, remuxWithFfmpeg } = require('./downloads/hls');
+const { downloadHls, resolveMediaPlaylist, muxWithFfmpeg, remuxWithFfmpeg, detectUnknownVideoCodec } = require('./downloads/hls');
 const {
   ensureYtDlp,
   findYtDlp,
@@ -31,7 +32,7 @@ const {
 const { loadCookiesFile } = require('./http');
 const { appendHistory } = require('./history');
 const { extractPageMediaViaElectron, fetchTextViaElectron, pickMediaPair } = require('./browser-page');
-const { resolveImagePost, pickPostImages, fetchPixivIllust, fetchPixivIllustViaMirror, downloadImages } = require('./images');
+const { detectImagePost, resolveImagePost, pickPostImages, fetchPixivIllust, fetchPixivIllustViaMirror, downloadImages } = require('./images');
 const {
   ensureDir,
   uniquePath,
@@ -54,6 +55,8 @@ class VideoDownloader extends EventEmitter {
       ...options,
     };
     this.tasks = new Map();
+    /** 上一次浏览器兜底被风控/验证码挡住的原因（用于给出有用的报错，而不是 yt-dlp 的连接重置） */
+    this.lastBlockedReason = '';
   }
 
   updateOptions(patch = {}) {
@@ -162,6 +165,7 @@ class VideoDownloader extends EventEmitter {
   async download(url, options = {}) {
     const opts = { ...this.options, ...options };
     const taskId = opts.taskId || randomId('task');
+    this.lastBlockedReason = '';
     const controller = new AbortController();
     if (opts.signal) {
       if (opts.signal.aborted) controller.abort();
@@ -285,7 +289,40 @@ class VideoDownloader extends EventEmitter {
         if (bin) {
           task.engine = 'ytdlp';
           emitProgress({ stage: 'download', percent: 0, message: 'yt-dlp 下载中' });
+          /**
+           * 抖音**短链**（`v.douyin.com/xxxxx`）先走内置浏览器。
+           *
+           * 为什么（2026-10-17 真实现场）：yt-dlp 不认这种短码，会退化成 generic 提取器，
+           * 拿普通 UA 去 GET 那个短链 —— 抖音直接把连接重置（10054），
+           * 报出来的是一大串 "Unable to download webpage / ConnectionResetError"，
+           * 群友看到的是一句"这个视频没下下来"。而内置浏览器跟一个 302 就到了
+           * `www.douyin.com/video|note/<id>`，视频/图文/直播三种都能处理。
+           * 所以这类链接**先给浏览器**，它不行再退回 yt-dlp。
+           */
+          const shortPage = info.finalUrl || url;
+          if (!looksLikeLiveUrl(shortPage) && isDouyinShortLink(shortPage) && opts.browserAssist !== false) {
+            log('这是抖音短链，先用内置浏览器打开（yt-dlp 不认这种短码）', { notice: true });
+            try {
+              const early = await this.#tryBrowserAssist(shortPage, info, {
+                ...opts,
+                outDir,
+                baseName,
+                cookies,
+                signal,
+                ffmpegPath,
+                task,
+                emitProgress,
+                log,
+                startedAt,
+              });
+              if (early) return early;
+            } catch (err) {
+              if (signal.aborted) throw err;
+              log(`内置浏览器这条路没走通（${String(err.message).split('\n')[0]}），改试 yt-dlp`, { notice: true });
+            }
+          }
           // 直播页面（如 live.bilibili.com）交给内置录制引擎，才能随时结束并保存成可播放文件
+          let liveDetected = false;
           if (looksLikeLiveUrl(info.finalUrl || url) || opts.live) {
             try {
               const streamInfo = await getStreamInfo(info.finalUrl || url, {
@@ -297,6 +334,7 @@ class VideoDownloader extends EventEmitter {
                 logger: log,
               });
               if (streamInfo.isLive) {
+                liveDetected = true;
                 const recorded = await this.#recordLiveStream(info.finalUrl || url, info, streamInfo, {
                   ...opts,
                   outDir,
@@ -315,6 +353,15 @@ class VideoDownloader extends EventEmitter {
               if (signal.aborted) throw err;
               log(`直播信息查询失败，按普通方式处理：${String(err.message).split('\n')[0]}`);
             }
+          }
+          // 已经确认是直播、而且调用方给了录制上限（`--live-seconds`）时，**绝不**再退回 yt-dlp：
+          // yt-dlp 对直播是一路录到流结束，没有任何时长概念 —— 调用方只能等到超时被杀，
+          // 留下一坨 `.part`（真实现场：213MB 的 `.flv.part`，群里只收到"下载超时"）。
+          // 宁可明确报错，也不让用户干等十分钟。
+          if (liveDetected && Number(opts.maxLiveSeconds) > 0) {
+            throw new Error(
+              `直播录制失败：内置录制引擎没能拉到该流（已放弃，避免退化成无限录制）。可稍后重试，或把「直播最长录制秒数」调大`,
+            );
           }
           try {
             const result = await downloadWithYtDlp({
@@ -356,6 +403,8 @@ class VideoDownloader extends EventEmitter {
               startedAt,
             });
             if (rescued) return rescued;
+            // 浏览器被风控挡住时，报"要人机验证"比报 yt-dlp 那串连接重置有用得多
+            if (this.lastBlockedReason) throw new Error(this.lastBlockedReason);
             throw err;
           }
         }
@@ -511,6 +560,8 @@ class VideoDownloader extends EventEmitter {
         electronPath: opts.electronPath,
         loadImages: Boolean(opts.loadImages),
         scroll: Boolean(opts.scroll),
+        // 登录态一起带进抓流浏览器：不然抖音这类站点会给个「验证码中间页」
+        cookies: opts.cookies,
       });
   }
 
@@ -532,9 +583,13 @@ class VideoDownloader extends EventEmitter {
   async #downloadImages(imagePost, ctx) {
     const { outDir, baseName, cookies, cookieHeader, signal, task, emitProgress, log, startedAt } = ctx;
     const opts = ctx;
+    // 动图要转 GIF，得知道 ffmpeg 在哪（调用方没传就自己找一份）
+    const ffmpegPath = ctx.ffmpegPath || findFfmpeg({ toolsDir: opts.toolsDir, explicitPath: opts.ffmpegPath });
 
     let title = baseName;
     let items = [];
+    // 动图（图文帖里那几张）：每项 {url: 动画 mp4, still: 静态首帧, durationSec, ...}
+    let animations = [];
     let referer = '';
     // Pixiv 分级（0 全年龄 / 1 成人向）。反代那条路拿不到分级时按 0 处理并在日志里说明，
     // 供 QQ Agent 插件那种"群里不该出现成人向"的场景做二次判断。
@@ -606,7 +661,9 @@ class VideoDownloader extends EventEmitter {
       emitProgress({ stage: 'probe', percent: -1, message: '渲染图文页面' });
       const data = await runner(imagePost.url, log);
       const images = pickPostImages((data && data.images) || []);
-      if (!images.length) throw new Error('页面里没有找到可下载的图片');
+      // 动图：结构化数据里带 videoUrl 的那几张（url_list 只是静态首帧）
+      animations = Array.isArray(data && data.animations) ? data.animations : [];
+      if (!images.length && !animations.length) throw new Error('页面里没有找到可下载的图片');
       title = sanitizeFilename(
         String(opts.name || (data && data.title) || imagePost.id)
           .replace(/\s*[-—|]\s*(抖音|小红书|TikTok|快手)\s*$/u, '')
@@ -616,39 +673,70 @@ class VideoDownloader extends EventEmitter {
       );
       items = images;
       referer = (data && data.finalUrl) || imagePost.url;
-      log(`图文帖「${(data && data.title) || imagePost.id}」：共 ${items.length} 张图片`, { notice: true });
+      log(
+        `图文帖「${(data && data.title) || imagePost.id}」：共 ${items.length} 张图片` +
+          `${animations.length ? `、${animations.length} 张动图` : ''}`,
+        { notice: true },
+      );
     }
 
-    if (!items.length) throw new Error('没有找到可下载的图片');
+    if (!items.length && !animations.length) throw new Error('没有找到可下载的图片');
 
     const targetDir = outDir;
-    const result = await downloadImages({
-      items,
-      outDir: targetDir,
-      baseName: title,
-      referer,
-      cookies,
-      cookieHeader,
-      userAgent: opts.userAgent,
-      headers: opts.headers,
-      signal,
-      concurrency: Math.max(1, Math.min(4, opts.concurrency || 3)),
-      logger: log,
-      // Pixiv 接口给的是原图地址，不需要探大小；页面抓来的要过滤掉表情/图标
-      verifySizes: imagePost.kind !== 'pixiv',
-      minImageBytes: opts.minImageBytes,
-      onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
-    });
+    const result = items.length
+      ? await downloadImages({
+          items,
+          outDir: targetDir,
+          baseName: title,
+          referer,
+          cookies,
+          cookieHeader,
+          userAgent: opts.userAgent,
+          headers: opts.headers,
+          signal,
+          concurrency: Math.max(1, Math.min(4, opts.concurrency || 3)),
+          logger: log,
+          // Pixiv 接口给的是原图地址，不需要探大小；页面抓来的要过滤掉表情/图标
+          verifySizes: imagePost.kind !== 'pixiv',
+          minImageBytes: opts.minImageBytes,
+          onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
+        })
+      : { files: [], failed: [], bytes: 0, total: 0, dir: targetDir };
 
-    log(`图片下载完成：${result.files.length}/${result.total} 张，共 ${formatBytes(result.bytes)}`, { notice: true });
-    if (result.failed.length) {
-      log(`有 ${result.failed.length} 张失败（例如：${result.failed[0].error}）`);
+    if (items.length) {
+      log(`图片下载完成：${result.files.length}/${result.total} 张，共 ${formatBytes(result.bytes)}`, { notice: true });
+      if (result.failed.length) {
+        log(`有 ${result.failed.length} 张失败（例如：${result.failed[0].error}）`);
+      }
     }
+
+    // 动图：下那段 mp4 → 转 GIF（QQ 里才会动）。失败保留 mp4，当视频发
+    let animFiles = [];
+    let animBytes = 0;
+    if (animations.length) {
+      const got = await this.#downloadAnimations(animations, {
+        outDir: result.files.length > 1 ? result.dir : targetDir,
+        baseName: title,
+        referer,
+        cookies,
+        cookieHeader,
+        userAgent: opts.userAgent,
+        headers: opts.headers,
+        ffmpegPath,
+        signal,
+        log,
+        emitProgress,
+      });
+      animFiles = got.files;
+      animBytes = got.bytes;
+    }
+
     // 全部失败时不能算成功
-    if (!result.files.length) {
+    if (!result.files.length && !animFiles.length) {
       throw new Error(`没有下载到任何图片：${result.failed.length ? result.failed[0].error : '没有可下载的图片'}`);
     }
-    const finalPath = result.files.length === 1 ? result.files[0] : result.dir;
+    const allFiles = [...result.files, ...animFiles];
+    const finalPath = allFiles.length === 1 ? allFiles[0] : result.dir || targetDir;
     return this.#finish(task.id, {
       filePath: finalPath,
       bytes: result.bytes,
@@ -697,23 +785,43 @@ class VideoDownloader extends EventEmitter {
       log(`内置浏览器渲染失败：${err.message}`);
       return null;
     }
-    const pair = pickMediaPair(data && data.media);
+    // 直播页面上往往同时有「直播连续流」和几秒钟的「预览 mp4」，直播场景要优先前者
+    const liveIntent = Boolean(opts.live) || Number(opts.maxLiveSeconds) > 0 || looksLikeLiveUrl(pageUrl);
+    const pair = pickMediaPair(data && data.media, { preferLive: liveIntent });
+    /**
+     * 这条页面是不是**图文帖**？它是"要不要去抓页面里的图片"的总开关，必须在任何使用点之前算好
+     * （2026-10-17 踩过：声明写在下面的分支里，结果 B 站专栏一进来就 `Cannot access 'isNotePost'
+     *  before initialization` —— TDZ 报错，而且是"所有没有视频流的页面"全挂）。
+     * 判定来源：① 页面里的结构化数据 `notePost`（抖音 aweme detail）；② URL 本身是 note 页。
+     */
+    const isNotePost = Boolean(data && data.notePost === true) || Boolean(detectImagePost(pageUrl));
     // 站点风控/人机验证页：不要把它当成正常页面（否则会把验证码图片当成正文图存下来）
     const pageTitle = String((data && data.title) || '');
     const pageText = String((data && data.bodyText) || '');
     if (/验证码|安全验证|人机验证|滑动验证|访问异常|环境异常|captcha|just a moment|attention required|access denied|verify you are human|bot detection/i.test(`${pageTitle} ${pageText}`)) {
-      log(
-        `页面被站点拦截了（标题：${pageTitle || '无'}）——这通常是风控要求人机验证。请稍后重试；` +
-          '或先用界面上的「登录」在内置浏览器里打开一次该站点、通过验证后再下载。',
-        { notice: true },
-      );
+      /**
+       * 风控页要**明确报出来**，不能让上层退回 yt-dlp 再抛一串 "ConnectionResetError" ——
+       * 那样群里只会看到"这个视频没下下来"，用户完全不知道该怎么办（2026-10-17 真实现场）。
+       */
+      const hint =
+        `站点要求人机验证（标题：${pageTitle || '验证码页'}）：这台机器上用桌面版工具的内置浏览器` +
+        '打开一次该站点、把验证过掉（需要登录的顺手登录），之后就会带着这份 cookie 正常下载';
+      this.lastBlockedReason = hint;
+      log(hint, { notice: true });
       return null;
     }
-    if (!pair.video) {
+    if (!pair.video || (data && data.notePost === true)) {
       // 没有视频流时，看看是不是图文帖（抖音图文等）
-      const images = pickPostImages((data && data.images) || []);
-      if (images.length) {
-        log(`页面里没有视频流，但发现 ${images.length} 张图片，按图文帖下载`, { notice: true });
+      // ⚠️ 只有"确认是图文帖/专栏页"才去抓页面图片：普通视频页里没抓到视频时，
+      // 页面上那些图全是头像/封面/推荐流缩略图，抓下来就成了"下载了无关图"（2026-10-17 现场）。
+      const images = isNotePost || articleLike ? pickPostImages((data && data.images) || []) : [];
+      // 图文帖里的**动图**：结构化数据里带 videoUrl 的那几张（见 browser-page.js）
+      const animations = Array.isArray(data && data.animations) ? data.animations : [];
+      if (images.length || animations.length) {
+        log(
+          `页面里没有视频流，但发现 ${images.length} 张图片${animations.length ? `、${animations.length} 张动图` : ''}，按图文帖下载`,
+          { notice: true },
+        );
         const imageTitle = sanitizeFilename(
           String(data.title || info.title || baseName || pageUrl)
             .replace(/\s*[-—|]\s*(抖音|小红书|TikTok)\s*$/u, '')
@@ -736,17 +844,49 @@ class VideoDownloader extends EventEmitter {
           verifySizes: true,
           minImageBytes: opts.minImageBytes,
           onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
+        }).catch((err) => {
+          if (animations.length) {
+            log(`静态图没下成（继续下动图）：${err.message}`);
+            return { files: [], failed: [], bytes: 0, total: 0, dir: outDir };
+          }
+          throw err;
         });
-        log(`图片下载完成：${result.files.length}/${result.total} 张，共 ${formatBytes(result.bytes)}`, { notice: true });
+        if (images.length) {
+          log(`图片下载完成：${result.files.length}/${result.total} 张，共 ${formatBytes(result.bytes)}`, { notice: true });
+        }
         // 一张都没下下来就别报「完成」——那会让人以为存了东西
-        if (!result.files.length) {
+        if (!result.files.length && !animations.length) {
           const why = result.failed && result.failed.length ? result.failed[0].error : '没有可下载的图片';
           throw new Error(`没有下载到任何图片：${why}`);
         }
-        const finalPath = result.files.length === 1 ? result.files[0] : result.dir;
+
+        // 动图：下的是那段 mp4，转成 GIF 才能"动"（QQ 里 webp 动图显示不稳，gif 最保险）
+        let animFiles = [];
+        let animBytes = 0;
+        if (animations.length) {
+          const animDir = result.files.length > 1 ? result.dir : outDir;
+          const got = await this.#downloadAnimations(animations, {
+            outDir: animDir,
+            baseName: imageTitle,
+            referer: data.finalUrl || pageUrl,
+            cookies: ctx.cookies,
+            cookieHeader: opts.cookieHeader,
+            userAgent: opts.userAgent,
+            headers: opts.headers,
+            ffmpegPath: ctx.ffmpegPath,
+            signal,
+            log,
+            emitProgress,
+          });
+          animFiles = got.files;
+          animBytes = got.bytes;
+        }
+
+        const allFiles = [...result.files, ...animFiles];
+        const finalPath = allFiles.length === 1 ? allFiles[0] : animFiles.length && !result.files.length ? animFiles[0] : result.dir || outDir;
         return this.#finish(task.id, {
           filePath: finalPath,
-          bytes: result.bytes,
+          bytes: result.bytes + animBytes,
           engine: 'image',
           title: imageTitle,
           startedAt,
@@ -764,6 +904,50 @@ class VideoDownloader extends EventEmitter {
     const title = sanitizeFilename(rawTitle, baseName || 'video');
     const outPath = this.#resolveOutPath(outDir, title, '.mp4', opts.overwrite);
     const tmpSuffix = `${Date.now()}`;
+
+    /**
+     * 抖音的「图文帖」里**经常混着视频**（一条帖子几张图 + 一段视频）。
+     *
+     * 原来的逻辑是"有视频就只下视频"，于是那几张配图被整个忽略（用户 2026-10-17 报）。
+     * 现在：视频照旧下，若正文区域还收着配图，就把它们下到同一个目录，并把**目录**
+     * 交给上层（插件那边会把视频和图片一起发出去）。
+     *
+     * ⚠️ 但**只有确认是图文帖**才附带配图（`notePost` 来自结构化数据，或 URL 本身就是
+     * note 页）。否则普通视频页里的"图片"全是头像/封面/推荐流缩略图 ——
+     * 2026-10-17 第二条报障：一条抖音视频下完之后，文件夹里多出 14 张毫不相干的图。
+     *
+     * （`isNotePost` 在上面统一算好了，这里直接复用 —— 别再就地声明，会踩 TDZ。）
+     */
+    const postImages = isNotePost ? pickPostImages((data && data.images) || []) : [];
+    const finalizeVideo = async (videoPath, meta = {}) => {
+      const baseBytes = Number(meta.bytes) || fileSize(videoPath) || 0;
+      if (!postImages.length) return this.#finish(task.id, { ...meta, filePath: videoPath, bytes: baseBytes });
+      const dir = path.dirname(videoPath);
+      try {
+        emitProgress({ stage: 'download', percent: -1, message: '下载图文里的配图' });
+        const r = await downloadImages({
+          items: postImages,
+          outDir: dir,
+          baseName: `${title}（配图）`,
+          referer: data.finalUrl || pageUrl,
+          cookies: ctx.cookies,
+          cookieHeader: opts.cookieHeader,
+          userAgent: opts.userAgent,
+          headers: opts.headers,
+          signal,
+          concurrency: Math.max(1, Math.min(4, opts.concurrency || 3)),
+          logger: log,
+          verifySizes: true,
+          minImageBytes: opts.minImageBytes,
+          onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
+        });
+        log(`这条帖子除了视频还有 ${r.files.length} 张配图，已一起存到 ${dir}`, { notice: true });
+        return this.#finish(task.id, { ...meta, filePath: dir, bytes: baseBytes + (r.bytes || 0) });
+      } catch (err) {
+        log(`配图下载失败（视频照发）：${err.message}`);
+        return this.#finish(task.id, { ...meta, filePath: videoPath, bytes: baseBytes });
+      }
+    };
 
     // 页面里抓到的是播放列表 → 交给 HLS 引擎（点播照常下载，直播则持续录制）
     const captured = pair.video.url;
@@ -786,8 +970,7 @@ class VideoDownloader extends EventEmitter {
         onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
         logger: log,
       });
-      return this.#finish(task.id, {
-        filePath: result.filePath,
+      return finalizeVideo(result.filePath, {
         bytes: result.bytes,
         engine: 'hls',
         title,
@@ -825,12 +1008,22 @@ class VideoDownloader extends EventEmitter {
           cleanupFile(result.filePath);
           filePath = mp4Path;
         } catch (err) {
+          // 转封装失败最常见的原因是源流是 HEVC(H.265) 的 FLV（enhanced-RTMP）：
+          // 内置 ffmpeg 的 FLV demuxer 不认 codec id 12，转出来是 "dimensions not set"。
+          // 这种情况下**绝不能**把 .flv 当成品返回（QQ 播不了，群友只会看到"下载出错"）。
+          const hevc = await detectUnknownVideoCodec(ctx.ffmpegPath, result.filePath);
+          cleanupFile(mp4Path);
+          if (hevc) {
+            cleanupFile(result.filePath);
+            throw new Error(
+              '这个直播是 HEVC(H.265) 编码的 FLV，内置 ffmpeg 解不开（enhanced-RTMP 未支持），' +
+                '已放弃以免发出播不了的文件。稍后重试通常会自动改抓 H.264 流',
+            );
+          }
           log(`转封装失败，保留 FLV：${err.message}`);
         }
       }
-      return this.#finish(task.id, {
-        filePath,
-        bytes: fileSize(filePath),
+      return finalizeVideo(filePath, {
         engine: 'stream',
         title,
         startedAt,
@@ -889,13 +1082,72 @@ class VideoDownloader extends EventEmitter {
     }
 
     log('已通过内置浏览器方式完成下载');
-    return this.#finish(task.id, {
-      filePath,
-      bytes: fileSize(filePath),
+    return finalizeVideo(filePath, {
       engine: 'browser',
       title,
       startedAt,
     });
+  }
+
+  /**
+   * 下载图文帖里的**动图**。
+   *
+   * 抖音图文帖的"动图"在结构化数据里是一段 2~3 秒的 **mp4**（`images[i].video`），
+   * 而 `url_list` 里那串 `~tplv-dy-aweme-images:q75.webp` 只是**静态首帧** ——
+   * 以前我们只下首帧，于是动图都变成了普通图片（2026-10-17 用户报）。
+   *
+   * 这里把 mp4 下下来，再用 ffmpeg 转成 **GIF**（QQ 里 gif 一定动；webp 动图显示不稳）。
+   * 没有 ffmpeg 或转换失败就保留 mp4，上层会当视频发出去 —— 总比丢掉强。
+   */
+  async #downloadAnimations(list, ctx) {
+    const { outDir, baseName, referer, cookies, cookieHeader, userAgent, headers, ffmpegPath, signal, log, emitProgress } = ctx;
+    const items = (list || []).filter((x) => x && x.url);
+    if (!items.length) return { files: [], bytes: 0 };
+    const dir = items.length > 1 ? path.join(outDir, `${sanitizeFilename(baseName || 'post', 'post')}（动图）`) : outDir;
+    ensureDir(dir);
+    const files = [];
+    let bytes = 0;
+    for (let i = 0; i < items.length; i += 1) {
+      if (signal?.aborted) break;
+      const stem = String(i + 1).padStart(3, '0');
+      const mp4 = path.join(dir, `${stem}.mp4`);
+      try {
+        emitProgress({ stage: 'download', percent: -1, message: `下载动图 ${i + 1}/${items.length}` });
+        const got = await downloadDirect({
+          url: items[i].url,
+          outPath: mp4,
+          resume: false,
+          referer,
+          cookies,
+          cookieHeader,
+          userAgent,
+          headers,
+          signal,
+          timeout: 60000,
+          onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
+          logger: log,
+        });
+        bytes += fileSize(got.filePath) || 0;
+        if (ffmpegPath) {
+          const gif = path.join(dir, `${stem}.gif`);
+          try {
+            await toGif(ffmpegPath, got.filePath, gif, { signal, log });
+            cleanupFile(got.filePath);
+            files.push(gif);
+            continue;
+          } catch (err) {
+            log(`动图 ${i + 1} 转 GIF 失败（保留 mp4 当视频发）：${String(err.message).split('\n')[0]}`);
+          }
+        } else {
+          log('没有 ffmpeg，动图只能按 mp4 保存', { notice: true });
+        }
+        files.push(got.filePath);
+      } catch (err) {
+        log(`动图 ${i + 1} 下载失败：${String(err.message).split('\n')[0]}`);
+      }
+    }
+    if (files.length) log(`动图下载完成：${files.length}/${items.length} 张`, { notice: true });
+    return { files, bytes };
   }
 
   /**
@@ -1162,6 +1414,71 @@ function cleanupFile(p) {
   }
 }
 
+/**
+ * 把一段短视频（图文帖里的"动图"其实是 2~3 秒的 mp4）转成 GIF。
+ *
+ * 为什么是 GIF 而不是保留 webp/mp4：QQ 里 gif 一定会动，动图 webp 显示不稳；
+ * mp4 则会被当成"视频"发，和"动图"的观感差别太大。
+ *
+ * ⚠️ 体积必须管住：一开始按 540px/12fps 转，一个 3 秒动图就 7MB+（实测），
+ * 群里发图既慢又浪费。所以这里按「480px/10fps → 360px/8fps → 240px/6fps」逐档降，
+ * 直到文件 ≤ maxBytes（默认 2.5MB）为止 —— 动图本来就不需要高清。
+ */
+async function toGif(ffmpegPath, input, output, { signal, log = () => {}, maxBytes = 2.5 * 1024 * 1024 } = {}) {
+  const attempts = [
+    { maxSide: 480, fps: 10, bayer: 5 },
+    { maxSide: 360, fps: 8, bayer: 6 },
+    { maxSide: 240, fps: 6, bayer: 6 },
+  ];
+  for (let i = 0; i < attempts.length; i += 1) {
+    const a = attempts[i];
+    const vf =
+      `fps=${a.fps},scale='min(${a.maxSide},iw)':'min(${a.maxSide},ih)':force_original_aspect_ratio=decrease:flags=lanczos,` +
+      `split[x][y];[x]palettegen=stats_mode=diff[p];[y][p]paletteuse=dither=bayer:bayer_scale=${a.bayer}`;
+    const args = ['-y', '-hide_banner', '-loglevel', 'error', '-t', '10', '-i', input, '-vf', vf, '-loop', '0', output];
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve, reject) => {
+      let child;
+      try {
+        child = spawn(ffmpegPath, args, { windowsHide: true });
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      let stderr = '';
+      child.stderr?.on('data', (d) => {
+        if (stderr.length < 4000) stderr += d.toString();
+      });
+      const onAbort = () => {
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      child.once('error', (err) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        reject(err);
+      });
+      child.once('close', (code) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        if (code === 0 && fileSize(output) > 0) resolve();
+        else {
+          cleanupFile(output);
+          reject(new Error(`ffmpeg 转 GIF 失败（退出码 ${code}）：${stderr.trim().split('\n').slice(-2).join(' | ')}`));
+        }
+      });
+    });
+    const size = fileSize(output);
+    if (size <= maxBytes || i === attempts.length - 1) {
+      log(`动图已转成 GIF（${a.maxSide}px/${a.fps}fps，${formatBytes(size)}）`);
+      return output;
+    }
+  }
+  return output;
+}
+
 /** URL 看起来像直播页面（用于决定是否值得先花一次 yt-dlp 解析去确认直播状态） */
 function looksLikeLiveUrl(u) {
   try {
@@ -1174,6 +1491,20 @@ function looksLikeLiveUrl(u) {
     if (/twitch\.tv$/.test(host)) return true;
     if (/youtube\.com$/.test(host) && /\/live/.test(path)) return true;
     return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 抖音**短链**（`v.douyin.com/<短码>`）：yt-dlp 不认这种码，会退化成 generic 提取器，
+ * 然后被抖音重置连接（10054，报一大串 ConnectionResetError）。这类链接先交给内置浏览器 ——
+ * 它跟着 302 就到了 `www.douyin.com/video|note/<id>`，视频/图文/直播都能处理。
+ */
+function isDouyinShortLink(u) {
+  try {
+    const host = new URL(u).hostname.toLowerCase();
+    return host === 'v.douyin.com' || host === 'v.iesdouyin.com' || /^v[-a-z0-9]*\.douyin\.com$/.test(host);
   } catch {
     return false;
   }

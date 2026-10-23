@@ -219,10 +219,18 @@ function collect(stream) {
 
 /** 组装成 fetch 风格的 Response（只覆盖内置下载器用到的那部分） */
 function toFetchResponse(res) {
-  let buffered = null;
   // 必须是真正的 web ReadableStream：内置下载器会用它做 Readable.fromWeb 流式下载，
   // 也会用它做 body.cancel() 及时释放连接（空转的假对象会让流式下载直接报错）
   const body = Readable.toWeb(res.stream);
+  /**
+   * ⚠️ 2026-10-19 修的一个**真 bug**（害了整整半天）：原来 arrayBuffer()/text() 用的是
+   * `collect(res.stream)` —— 可 `Readable.toWeb(res.stream)` 已经把同一个 Node 流
+   * 接管成 web 流，两边**抢同一份数据**：web 流先读走时，`collect` 的 'end' 永远不来，
+   * 于是 `arrayBuffer()` 一直挂着，直到调用方超时（表现成"连接被重置/超时"）。
+   * 现场对照：同一时刻 .NET 400ms 拿到 56KB、裸 socket 579ms 拿到 63KB，
+   * 而这条路径 6 秒都读不完 body —— 所以问题从来不在代理或节点。
+   * 现在 body 只有**一个消费者**：要 Buffer 就从同一个 web 流读。
+   */
   return {
     status: res.status,
     statusText: res.statusText,
@@ -232,12 +240,10 @@ function toFetchResponse(res) {
     body,
     response: { body },
     async arrayBuffer() {
-      if (!buffered) buffered = await collect(res.stream);
-      return buffered;
+      return new Response(body).arrayBuffer();
     },
     async text() {
-      if (!buffered) buffered = await collect(res.stream);
-      return buffered.toString('utf8');
+      return new Response(body).text();
     },
   };
 }

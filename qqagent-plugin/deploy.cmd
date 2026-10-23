@@ -34,6 +34,13 @@ if exist "%SEARCHCMD%" (
   echo [WARN] search-command.mjs missing - "wo yao xxx de tu" commands will go to the model
 )
 
+rem Edge cookie reader - the plugin imports it as ./edge-cookies.mjs (Microsoft Edge login state)
+if exist "%SRC%\edge-cookies.mjs" (
+  copy /Y "%SRC%\edge-cookies.mjs" "%DST%\edge-cookies.mjs" >nul || exit /b 1
+) else (
+  echo [WARN] edge-cookies.mjs missing - downloads will not reuse the Edge login state
+)
+
 rem bundle the TOOL itself into the plugin (basic CLI + engine, no GUI/icons).
 rem --skip-existing: the big binaries (yt-dlp/ffmpeg/Electron) are not copied again on every deploy.
 rem --with-electron: also ship the Electron runtime so browser-rendered sites (douyin) work

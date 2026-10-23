@@ -15,7 +15,7 @@ const { spawn } = require('child_process');
 const { ensureDir, electronChildEnv } = require('./util');
 const { findElectron } = require('./browser-login');
 const { guardWebContents } = require('./browser-guard');
-const { pickPostImages, extractImagesFromRouter, IMAGE_HOSTS } = require('./images');
+const { pickPostImages, extractImagesFromRouter, baseImageKey, IMAGE_HOSTS } = require('./images');
 
 /**
  * 在页面里执行的抽取脚本（返回结构化结果）。
@@ -27,7 +27,7 @@ function buildExtractScript(cfg = {}) {
   const config = { scroll: Boolean(cfg.scroll), scrollStepMs: Number(cfg.scrollStepMs || 220), maxScrollMs: Number(cfg.maxScrollMs || 20000) };
   return `(async () => {
   const CFG = ${JSON.stringify(config)};
-  const out = { title: document.title, href: location.href, router: null, videoSrcs: [], domUrls: [], images: [], scrolled: 0, bodyText: '' };
+  const out = { title: document.title, href: location.href, router: null, videoSrcs: [], domUrls: [], images: [], scrolled: 0, bodyText: '', awemeImages: [], awemeDesc: '' };
   try {
     // 页面正文开头（用于识别「人机验证 / 访问异常」这类风控页，标题常常还是正常的）
     out.bodyText = String((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ').slice(0, 1500);
@@ -35,6 +35,50 @@ function buildExtractScript(cfg = {}) {
   try {
     if (window._ROUTER_DATA) out.router = JSON.stringify(window._ROUTER_DATA);
   } catch (e) { /* ignore */ }
+  /**
+   * 抖音图文帖的**结构化数据**（aweme detail）。这里才有"哪几张其实是动图"的信息。
+   *
+   * 2026-10-17 用户报「图文贴里的动图保存成了普通图片」，查下来是这样的：
+   *   · 动图在 url_list 里只是**静态首帧**（后缀 ~tplv-dy-aweme-images:q75.webp），
+   *     我们一直下的就是它 —— 所以动图变成了普通图片；
+   *   · 真正的动画在同一条目的 images[i].video.play_addr.url_list（一段 2~3 秒的 mp4）。
+   * 而且新版页面已经没有 window._ROUTER_DATA 了，只能从页面里（带着登录态）请求这个接口。
+   */
+  try {
+    const idm = /\\/note\\/(\\d{10,})/.exec(location.href) || /[?&]modal_id=(\\d{10,})/.exec(location.href);
+    out.awemeHref = location.href;
+    if (idm && idm[1]) {
+      out.awemeId = idm[1];
+      const res = await fetch('/aweme/v1/web/aweme/detail/?aweme_id=' + idm[1] + '&aid=6383&device_platform=webapp', {
+        credentials: 'include',
+        headers: { referer: location.href, accept: 'application/json' }
+      });
+      const j = await res.json();
+      const d = j && j.aweme_detail;
+      if (d && Array.isArray(d.images)) {
+        out.awemeDesc = String(d.desc || '');
+        out.awemeImages = d.images.map(function (img) {
+          const urls = (img && img.url_list) || [];
+          const addr = img && img.video && img.video.play_addr;
+          const vids = (addr && (addr.url_list || addr.urlList)) || [];
+          return {
+            url: urls[0] || '',
+            videoUrl: vids[0] || '',
+            durationMs: (img && img.video && img.video.duration) || 0,
+            width: (img && img.width) || 0,
+            height: (img && img.height) || 0,
+            uri: (img && img.uri) || ''
+          };
+        });
+      } else {
+        out.awemeError = 'aweme_detail.images 不存在（status=' + (res && res.status) + '）';
+      }
+    } else {
+      out.awemeError = 'URL 里没有 note id';
+    }
+  } catch (e) {
+    out.awemeError = String((e && e.message) || e);
+  }
   try {
     document.querySelectorAll('video').forEach((v) => {
       if (v.src) out.videoSrcs.push(v.src);
@@ -134,10 +178,37 @@ function buildExtractScript(cfg = {}) {
   try {
     const detail = document.querySelector('[data-e2e="note-detail"]');
     const nextBtn = () => document.querySelector('[data-e2e="video-switch-next-arrow"]');
+    /**
+     * 当前这一张是哪张图。
+     *
+     * ⚠️ 原来是 imgs.find(匹配 aweme-images) —— 可图文帖的多张图**同时都在 DOM 里**
+     * （2026-10-17 实测：正文区域 6 张全都在），find 永远返回第一张，
+     * 于是"翻页"时始终读到同一张 → stale>=4 直接判定到底 → 只收集到 1 张，
+     * 外面又"有 slides 就只认 slides"，最后 6 张只下 1 张。
+     * 现在按"真的显示在视口里、且没有被 hidden/opacity:0 藏起来"来选；
+     * 一张都判不出来时再退回第一张（老行为，不至于一张都不收集）。
+     */
     const currentSlide = () => {
       const imgs = [...detail.querySelectorAll('img')];
-      const big = imgs.find((i) => /aweme-images|aweme_images/i.test(i.currentSrc || i.src || ''));
-      return big ? (big.currentSrc || big.src) : '';
+      const candidates = imgs.filter((i) => /aweme-images|aweme_images/i.test(i.currentSrc || i.src || ''));
+      if (!candidates.length) return '';
+      const vw = window.innerWidth || 1280;
+      const vh = window.innerHeight || 900;
+      const visible = candidates.find((i) => {
+        const r = i.getBoundingClientRect();
+        if (!r.width || !r.height) return false;
+        // 横向轮播：只要求"在视口横向上"且上下有交集，别把左右预加载的也算进来
+        if (r.right <= 0 || r.left >= vw) return false;
+        if (r.bottom <= 0 || r.top >= vh) return false;
+        try {
+          const st = getComputedStyle(i);
+          if (st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+          if (st.display === 'none') return false;
+        } catch (e) { /* ignore */ }
+        return true;
+      });
+      const pick = visible || candidates[0];
+      return pick ? (pick.currentSrc || pick.src || '') : '';
     };
     if (detail && nextBtn()) {
       const slides = [];
@@ -257,6 +328,16 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+/** 抓流浏览器用的 preload（把 HEVC 判死，逼站点发 H.264）；文件缺失就返回 undefined 正常跑 */
+function noHevcPreloadPath() {
+  try {
+    const p = path.join(__dirname, 'preload-nohevc.js');
+    return fs.existsSync(p) ? p : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 判断一个网络请求地址是否可能是视频媒体流 */
 function isMediaUrl(u) {
   const url = String(u || '');
@@ -292,6 +373,38 @@ function isAudioMediaUrl(u) {
 }
 
 /** 在 Electron 里渲染页面并抽取（供主进程直接调用） */
+/**
+ * 把 Netscape 解析出来的 cookie 灌进浏览器 session。
+ *
+ * 为什么需要（2026-10-17）：抖音这类站点对"没有登录态的新浏览器"非常敏感 ——
+ * 同一个链接在桌面版（有登录 cookie）里能打开，在抓流用的干净 session 里直接是
+ * 「验证码中间页」。把 `--cookies` 里那份登录态塞进去，风控页基本就没了。
+ */
+async function applyCookiesToSession(ses, cookies) {
+  const list = (Array.isArray(cookies) ? cookies : []).filter((c) => c && c.name && c.domain);
+  if (!list.length) return 0;
+  let n = 0;
+  for (const c of list) {
+    const domain = String(c.domain || '').trim();
+    if (!domain) continue;
+    const host = domain.replace(/^\./, '');
+    try {
+      await ses.cookies.set({
+        url: `https://${host}/`,
+        name: String(c.name),
+        value: String(c.value == null ? '' : c.value),
+        domain,
+        path: '/',
+        secure: true,
+      });
+      n += 1;
+    } catch {
+      /* 单条设置失败不影响其它 cookie */
+    }
+  }
+  return n;
+}
+
 async function extractPageMediaInProcess(
   { BrowserWindow, session },
   {
@@ -304,11 +417,34 @@ async function extractPageMediaInProcess(
     loadTimeoutMs = 25000,
     loadImages = false,
     scroll = false,
+    cookies = null,
   },
 ) {
   const ses = session.fromPartition(partition);
+  // 有登录态就先灌进去（否则抖音这类站点直接甩「验证码中间页」）
+  try {
+    const applied = await applyCookiesToSession(ses, cookies);
+    if (applied) onLog(`已带上 ${applied} 条登录 cookie 打开页面`);
+  } catch {
+    /* ignore */
+  }
   // 图文帖要真正加载图片，轮播里的 <img> 才会从占位图换成真实地址
-  const win = new BrowserWindow({ show: false, width: 1280, height: 900, webPreferences: { session: ses, images: loadImages } });
+  const win = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 900,
+    webPreferences: {
+      session: ses,
+      images: loadImages,
+      // 抓流浏览器专用 preload：把 HEVC 判死，逼抖音这类站点发 H.264（否则录下来的
+      // FLV 是 HEVC，内置 ffmpeg 的 FLV demuxer 不认，转封装必失败 → 只能发一坨播不了的 .flv）。
+      // 必须 contextIsolation:false，preload 才与页面同一个世界、改得动 MediaSource。
+      preload: noHevcPreloadPath(),
+      contextIsolation: false,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
   // 默认 UA 里带 "Electron/38" 这种字样，B 站等站点会据此判定为自动化访问（弹验证码），去掉更接近普通 Chrome
   const cleanUa = String(userAgent || win.webContents.getUserAgent()).replace(/\sElectron\/[\d.]+/i, '').trim();
   try {
@@ -428,13 +564,28 @@ async function extractPageMediaInProcess(
         /* ignore */
       }
     }
+    // 结构化数据（aweme detail）：静态图的 url_list 首帧 + 哪些是动图（videoUrl 非空）
+    const awemeList = Array.isArray(data.awemeImages) ? data.awemeImages.filter((x) => x && x.url) : [];
+    const awemeStills = awemeList
+      .filter((x) => !x.videoUrl)
+      .map((x) => ({ url: x.url, width: x.width, height: x.height, scope: 'note' }));
+    const animations = awemeList
+      .filter((x) => x.videoUrl)
+      .map((x) => ({
+        url: x.videoUrl,
+        still: x.url,
+        width: x.width,
+        height: x.height,
+        durationSec: Math.max(1, Math.round((Number(x.durationMs) || 0) / 1000))
+      }));
+    if (animations.length) onLog(`这条图文帖里有 ${animations.length} 张动图（会下成 GIF）`);
     const rawImages = [
       ...slideCandidates,
+      ...awemeStills,
       ...routerImages,
       ...(data.images || []),
       ...networkImages.map((url) => ({ url })),
-    ];
-    // 排查「该下的图被过滤掉了」时用：把原始候选写出来（VIDEOGRAB_DUMP_IMAGES=路径）
+    ];    // 排查「该下的图被过滤掉了」时用：把原始候选写出来（VIDEOGRAB_DUMP_IMAGES=路径）
     if (process.env.VIDEOGRAB_DUMP_IMAGES) {
       try {
         fs.writeFileSync(process.env.VIDEOGRAB_DUMP_IMAGES, JSON.stringify(rawImages, null, 1), 'utf8');
@@ -442,13 +593,22 @@ async function extractPageMediaInProcess(
         /* ignore */
       }
     }
-    const images = pickPostImages(rawImages);
+    // 动图会下成 GIF（见 downloader.js），所以它的**静态首帧**不要再当普通图片下一遍
+    const animKeys = new Set(
+      animations.map((a) => (a.still ? baseImageKey(a.still) : '')).filter(Boolean),
+    );
+    const images = pickPostImages(rawImages).filter((im) => !animKeys.has(baseImageKey(im.url)));
     return {
       title: data.title || '',
       finalUrl: data.href || win.webContents.getURL(),
       media,
       images,
       slides: (data.slides || []).map((x) => (typeof x === 'string' ? x : x.url)),
+      // 这是一条**图文帖**（拿到过结构化数据）——上层据此优先走"图片/动图"路径，
+      // 而不是把动图那段 2 秒 mp4 当成"这条帖子的视频"
+      notePost: awemeList.length > 0,
+      noteDesc: String(data.awemeDesc || ''),
+      animations,
       scrolled: Number(data.scrolled || 0),
       bodyText: String(data.bodyText || '').slice(0, 600),
       networkCount: networkUrls.length,
@@ -587,15 +747,24 @@ function fetchTextViaElectron({ appRoot, url, pageUrl, onLog = () => {}, signal,
 
 /**
  * 从候选里挑出一条视频 + 一条音轨（音视频分离的站点需要分别下载再合并）。
+ *
+ * @param {Array} media 候选列表
+ * @param {object} [opts]
+ * @param {boolean} [opts.preferLive] 直播场景：优先**连续流**（.flv / .m3u8），
+ *   而不是页面里那些几秒钟的 mp4 预告片。
+ *   踩过的坑（2026-10-17）：抖音直播间页面上同时有直播 FLV 和一段 2.6 秒的预览 mp4，
+ *   原来的打分让 mp4 胜出（+200）→ 录了个 2.6 秒的片段当"直播"发给群友。
  * @returns {{video: object|null, audio: object|null}}
  */
-function pickMediaPair(media) {
+function pickMediaPair(media, opts = {}) {
+  const preferLive = opts.preferLive === true;
   const list = (media || []).filter((m) => {
     const u = String(m.url || '');
     if (!/^https?:/i.test(u)) return false;
     if (/(douyinpic\.com|douyinstatic\.com\/obj\/tos-aweme-im-pc|\.dmg|\.exe|\.zip)(\?|$)/i.test(u)) return false;
-    return /douyinvod|douyincdn|bytecdn|mime_type=(video|audio)|\.mp4(\?|$)|\.m4s(\?|$)|\.m4a(\?|$)|video\/tos|aweme\/v1\/play/i.test(u);
+    return /douyinvod|douyincdn|bytecdn|mime_type=(video|audio)|\.mp4(\?|$)|\.m4s(\?|$)|\.m4a(\?|$)|\.flv(\?|$)|\.m3u8(\?|$)|video\/tos|aweme\/v1\/play/i.test(u);
   });
+  const isContinuous = (u) => /\.flv(\?|$)/i.test(u) || /\.m3u8(\?|$)/i.test(u);
   const score = (m) => {
     const u = String(m.url).toLowerCase();
     let s = 0;
@@ -603,6 +772,8 @@ function pickMediaPair(media) {
     if (u.includes('douyinvod') || u.includes('douyincdn')) s += 150;
     if (m.gear === '网络请求') s += 60;
     if (/1080|hd/.test(String(m.gear || '').toLowerCase())) s += 40;
+    // 直播场景：连续流优先（几秒的 mp4 预告片绝不能当直播录下来）
+    if (preferLive && isContinuous(u)) s += 5000;
     return s;
   };
   const audios = list.filter((m) => isAudioMediaUrl(m.url)).sort((a, b) => score(b) - score(a));
@@ -631,7 +802,7 @@ function dumpPageData(dir, name, payload) {
  * 通过拉起 Electron（应用目录为入口，用环境变量传参）来渲染页面并抽取媒体直链。
  * 供命令行使用；GUI 内部可直接调用 extractPageMediaInProcess。
  */
-function extractPageMediaViaElectron({ appRoot, url, waitSec = 8, onLog = () => {}, signal, electronPath, loadImages = false, scroll = false }) {
+function extractPageMediaViaElectron({ appRoot, url, waitSec = 8, onLog = () => {}, signal, electronPath, loadImages = false, scroll = false, cookies = null }) {
   return new Promise((resolve, reject) => {
     const bin = electronPath || findElectron(appRoot);
     if (!bin) {
@@ -639,6 +810,16 @@ function extractPageMediaViaElectron({ appRoot, url, waitSec = 8, onLog = () => 
       return;
     }
     const outFile = path.join(os.tmpdir(), `vgrab-page-${Date.now()}-${process.pid}.json`);
+    // cookie 通过临时文件传给辅助进程（环境变量只适合小字符串）
+    let cookiesFile = '';
+    if (Array.isArray(cookies) && cookies.length) {
+      try {
+        cookiesFile = path.join(os.tmpdir(), `vgrab-cookies-${Date.now()}-${process.pid}.json`);
+        fs.writeFileSync(cookiesFile, JSON.stringify(cookies), 'utf8');
+      } catch {
+        cookiesFile = '';
+      }
+    }
     onLog('正在启动内置浏览器渲染页面...');
     const child = spawn(bin, [appRoot, '--user-data-dir', path.join(os.tmpdir(), 'vgrab-browser-profile')], {
       windowsHide: true,
@@ -648,6 +829,7 @@ function extractPageMediaViaElectron({ appRoot, url, waitSec = 8, onLog = () => 
         VIDEOGRAB_PAGE_WAIT: String(waitSec),
         VIDEOGRAB_PAGE_IMAGES: loadImages ? '1' : '',
         VIDEOGRAB_PAGE_SCROLL: scroll ? '1' : '',
+        VIDEOGRAB_PAGE_COOKIES: cookiesFile,
       }),
     });
     let out = '';
@@ -683,6 +865,13 @@ function extractPageMediaViaElectron({ appRoot, url, waitSec = 8, onLog = () => 
     child.on('close', () => {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
+      if (cookiesFile) {
+        try {
+          fs.unlinkSync(cookiesFile);
+        } catch {
+          /* ignore */
+        }
+      }
       if (signal?.aborted) {
         reject(new Error('已取消'));
         return;

@@ -82,7 +82,7 @@ const cases = [
 ];
 
 const only = process.env.ONLY || '';
-const zipOnly = process.argv.includes('--zip') || process.argv.includes('--parse') || process.argv.includes('--cards') || process.argv.includes('--search') || process.argv.includes('--search-live') || process.argv.includes('--cmd') || process.argv.includes('--cmd-live');
+const zipOnly = process.argv.includes('--zip') || process.argv.includes('--parse') || process.argv.includes('--cards') || process.argv.includes('--search') || process.argv.includes('--search-live') || process.argv.includes('--cmd') || process.argv.includes('--cmd-live') || process.argv.includes('--live') || process.argv.includes('--edge') || process.argv.includes('--queue');
 let bad = 0;
 for (const [label, url] of (zipOnly ? [] : cases)) {
   if (only && !label.includes(only)) continue;
@@ -194,9 +194,53 @@ if (process.argv.includes('--zip')) {
     /测试图集标题\.zip$/.test(zipPath);
   console.log(okZip ? '    ✓ 9 张直发 + 6 张打包，压缩包名取自帖子标题' : '    ✗ 与预期不符');
   bad += okZip ? 0 : 1;
+
+  // ── 图文帖里混着视频：视频和配图必须**都**发出去 ──────────────────────────
+  // 2026-10-17 用户要求「抖音图文贴里会混着视频，请确保视频也下载」。
+  // 工具会把「一个视频 + 若干配图」放进同一目录并把目录交上来，这里验发送端不会漏。
+  console.log('\n=== 视频 + 配图同时存在 → 两样都发 ===');
+  const mixDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vgrab-mix-test-'));
+  fs.writeFileSync(path.join(mixDir, '帖子标题.mp4'), Buffer.alloc(4096, 3));
+  const mixSub = path.join(mixDir, '帖子标题（配图）');
+  fs.mkdirSync(mixSub, { recursive: true });
+  for (let i = 1; i <= 3; i += 1) {
+    fs.writeFileSync(path.join(mixSub, `00${i}.jpg`), Buffer.alloc(1024, i));
+  }
+  const mixArtifacts = mod.collectArtifacts(mixDir, settings, { recursive: true });
+  const sentMix = [];
+  const mixSender = {
+    async sendMedia(chatKey, segments) {
+      sentMix.push(segments);
+      console.log(`    → 发送 ${segments.length} 段 [${segments.map((s) => s.type).join('+')}]`);
+      return { message_id: 1 };
+    },
+    async sendTextBatch(chatKey, msgs) {
+      sentMix.push(msgs);
+      console.log('    → 发送文字:', msgs.join(' '));
+    }
+  };
+  const mixDesc = await mod.deliver({
+    sender: mixSender,
+    chatKey: 'group:10002',
+    artifacts: mixArtifacts,
+    url: 'https://www.douyin.com/note/1',
+    title: '帖子标题',
+    c: { ...settings, maxImages: 9, imageOverflow: 'rest', zipMaxMb: 200 },
+    log: (...a) => console.log('    [log]', ...a)
+  });
+  const mixFlat = sentMix.filter(Array.isArray).flat();
+  const mixVideo = mixFlat.filter((s) => s?.type === 'video').length;
+  const mixImages = mixFlat.filter((s) => s?.type === 'image').length;
+  const okMix = mixVideo === 1 && mixImages === 3 && /视频/.test(mixDesc) && /图片/.test(mixDesc);
+  console.log(`    collectArtifacts: 视频 ${mixArtifacts.video ? 1 : 0} 个、图片 ${mixArtifacts.images.length} 张（应 1 / 3）`);
+  console.log(`    发送结果：视频段 ${mixVideo}、图片段 ${mixImages}；返回「${mixDesc}」`);
+  console.log(okMix ? '    ✓ 视频和配图都发出去了' : '    ✗ 有东西被漏掉');
+  bad += okMix ? 0 : 1;
+
   try {
     fs.rmSync(box, { recursive: true, force: true });
     if (zipExists) fs.rmSync(zipPath, { force: true });
+    fs.rmSync(mixDir, { recursive: true, force: true });
   } catch {
     /* ignore */
   }
@@ -279,6 +323,46 @@ if (process.argv.includes('--cards')) {
   process.exitCode = bad === 0 ? 0 : 1;
 }
 
+// ── 本地确定性测试：图片"换指纹"（QQ 的 fast-upload 命中会让整条消息被静默丢弃）──
+if (process.argv.includes('--uniq')) {
+  console.log('\n=== 图片换指纹（uniqueImageForUpload）===');
+  const os2 = await import('node:os');
+  const crypto2 = await import('node:crypto');
+  const tmp = fs.mkdtempSync(path.join(os2.tmpdir(), 'vgrab-uniq-'));
+  const md5 = (f) => crypto2.createHash('md5').update(fs.readFileSync(f)).digest('hex');
+
+  // 造一张最小 JPEG（SOI + APP0 + DQT + EOI，ffmpeg 能认）
+  const jpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0xff, 0xdb, 0x00, 0x43, 0x00, ...new Array(64).fill(0x10), 0xff, 0xd9
+  ]);
+  const p = path.join(tmp, 'a.jpg');
+  fs.writeFileSync(p, jpeg);
+
+  const a = mod.uniqueImageForUpload(p, () => {});
+  const b = mod.uniqueImageForUpload(p, () => {});
+  const ok1 = Boolean(a) && Boolean(b) && md5(a) !== md5(p) && md5(b) !== md5(p) && md5(a) !== md5(b);
+  console.log(
+    `  ${ok1 ? '✓' : '✗'} 每次发送 md5 都不同（原=${md5(p).slice(0, 8)} a=${a ? md5(a).slice(0, 8) : '-'} b=${b ? md5(b).slice(0, 8) : '-'}）`
+  );
+  if (!ok1) bad += 1;
+
+  const head = a ? fs.readFileSync(a) : Buffer.alloc(0);
+  const headOk = head[0] === 0xff && head[1] === 0xd8 && head.length > jpeg.length;
+  console.log(`  ${headOk ? '✓' : '✗'} 仍是合法 JPEG 头（SOI 保留、只在中间插了 COM 段）`);
+  if (!headOk) bad += 1;
+
+  const com = a ? head.indexOf(Buffer.from([0xff, 0xfe])) : -1;
+  console.log(`  ${com === 2 ? '✓' : '✗'} COM 段位置在第 3 字节（紧跟 SOI）`);
+  if (com !== 2) bad += 1;
+
+  if (a) fs.unlinkSync(a);
+  if (b) fs.unlinkSync(b);
+  fs.rmSync(tmp, { recursive: true, force: true });
+  console.log(bad === 0 ? '\nPASS 图片换指纹检查通过' : `\nFAIL ${bad} 项`);
+  process.exitCode = bad === 0 ? 0 : 1;
+}
+
 // ── 本地确定性测试：搜图结果怎么处理（只下载 / 只发图 / 图+说明）──────────────
 if (process.argv.includes('--search')) {
   console.log('\n=== 搜图结果怎么处理（searchSendMode）===');
@@ -286,20 +370,20 @@ if (process.argv.includes('--search')) {
 
   // ① 三种模式的执行计划
   const plans = [
-    ['download（默认）', mod.searchPlan('download'), { chat: false, quiet: true, silentModel: true, startText: '', endText: '' }],
-    ['images', mod.searchPlan('images'), { chat: true, quiet: true, silentModel: false, startText: '', endText: '' }],
-    ['send', mod.searchPlan('send'), { chat: true, quiet: true, silentModel: false, startText: '开始搜图了', endText: '搜图结束了' }],
-    ['空值兜底', mod.searchPlan(''), { chat: false, quiet: true, silentModel: true, startText: '', endText: '' }],
-    ['乱七八糟的值兜底', mod.searchPlan('PDF'), { chat: false, quiet: true, silentModel: true, startText: '', endText: '' }]
+    ['download（默认）', mod.searchPlan('download'), { chat: false, quiet: true, silentModel: true, startText: '', hintText: '' }],
+    ['images', mod.searchPlan('images'), { chat: true, quiet: true, silentModel: false, startText: '', hintText: '' }],
+    ['send', mod.searchPlan('send'), { chat: true, quiet: true, silentModel: false, startText: '开始搜图了', hintText: '图片正在发送' }],
+    ['空值兜底', mod.searchPlan(''), { chat: false, quiet: true, silentModel: true, startText: '', hintText: '' }],
+    ['乱七八糟的值兜底', mod.searchPlan('PDF'), { chat: false, quiet: true, silentModel: true, startText: '', hintText: '' }]
   ];
   for (const [label, got, want] of plans) {
     const ok =
       got.chat === want.chat && got.quiet === want.quiet && got.silentModel === want.silentModel &&
-      (got.startText ?? '') === want.startText && (got.endText ?? '') === want.endText;
+      (got.startText ?? '') === want.startText && (got.hintText ?? '') === want.hintText;
     if (!ok) bad += 1;
     console.log(
       `  ${ok ? '✓' : '✗'} ${label}: chat=${got.chat} quiet=${got.quiet} silentModel=${got.silentModel}` +
-        ` 提示语=${got.startText || '—'}/${got.endText || '—'}`
+        ` 提示语=${got.startText || '—'}/${got.hintText || '—'}`
     );
   }
 
@@ -363,9 +447,123 @@ if (process.argv.includes('--search')) {
   } catch {
     /* ignore */
   }
+
+  // ④ 搜图失败**必须在群里反馈**（2026-10-18 用户报"pixiv 搜图失败没有在群内反馈"）
+  //    指令那条路消息被钩子 veto、模型不会出场 —— 失败时插件自己得说话。
+  //    这里用"必定失败的假工具"跑一遍，断言真的发了一句失败提示。
+  const failBox = fs.mkdtempSync(path.join(os.tmpdir(), 'vgrab-search-fail-'));
+  const failTool = path.join(failBox, 'tool');
+  fs.mkdirSync(path.join(failTool, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(failTool, 'src', 'cli.js'),
+    "process.stderr.write('ECONNRESET: pixiv 反代连接被重置\\n');\nprocess.exit(1);\n",
+    'utf8'
+  );
+  const failTexts = [];
+  const failSender = {
+    async sendMedia() {
+      return { message_id: 1 };
+    },
+    async sendTextBatch(chatKey, lines) {
+      failTexts.push(...lines);
+    }
+  };
+  const failSettings = { ...settings, toolRoot: failTool, searchEnabled: true, notifyFailure: true };
+  const failOut = await mod.performSearchRequest({
+    keyword: '测试关键词',
+    count: 1,
+    c: failSettings,
+    plan: mod.searchPlan('download'),   // 最苛刻：只下载模式（平时群里一个字都不发）
+    sender: failSender,
+    chatKey: 'group:10001',
+    log: () => {},
+    source: '指令',
+    forceFailureNotice: true
+  });
+  const failOk = failOut.ok === false && failTexts.length === 1 && /连不上 Pixiv|抓|ECONNRESET|失败/i.test(failTexts[0] || '');
+  if (!failOk) bad += 1;
+  console.log(`  ${failOk ? '✓' : '✗'} 搜图失败会反馈：ok=${failOut.ok}，群里收到 ${failTexts.length} 句「${failTexts[0] || '—'}」`);
+
+  // ⑤ 设置里关掉失败提示（notifyFailure=false）→ 不再打扰群里
+  failTexts.length = 0;
+  await mod.performSearchRequest({
+    keyword: '测试关键词',
+    count: 1,
+    c: { ...failSettings, notifyFailure: false },
+    plan: mod.searchPlan('download'),
+    sender: failSender,
+    chatKey: 'group:10001',
+    log: () => {},
+    source: '指令',
+    forceFailureNotice: true
+  });
+  const muteOk = failTexts.length === 0;
+  if (!muteOk) bad += 1;
+  console.log(`  ${muteOk ? '✓' : '✗'} notifyFailure=false 时不发失败提示（收到 ${failTexts.length} 句）`);
+
+  try {
+    fs.rmSync(failBox, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+
+  // ⑥ 免代理接口没搜到 → **自动改用 Pixiv 原生搜索**（工具侧，fixture 驱动，不联网）
+  const pixivCorePath = path.join(srcRoot, '..', 'src', 'core', 'pixiv.js');
+  if (fs.existsSync(pixivCorePath)) {
+    const px = (await import(pathToFileURL(pixivCorePath).href)).default || {};
+    const fixture = JSON.stringify({
+      error: false,
+      body: { illustManga: { data: [{ id: '123456', title: '原生命中', userName: '画师', xRestrict: 0, tags: ['初音ミク'] }] } }
+    });
+    let nativeCalls = 0;
+    const fakeFetch = async (u) => {
+      if (String(u).includes('pixiv.net/ajax/search')) {
+        nativeCalls += 1;
+        return fixture;
+      }
+      return JSON.stringify({ error: 'none', data: [] });   // 公开接口：空
+    };
+    const r = await px.searchPixiv('冷门关键词', { limit: 2, fetchText: fakeFetch, nativeFallback: true });
+    // 2026-10-20：原生搜索现在按「简体 → 繁体」逐个补，所以调用次数可能是 1~2 次（假数据只有 1 条）
+    const okNative = String(r.backend).includes('pixiv-native') && r.items.length >= 1 && nativeCalls >= 1;
+    if (!okNative) bad += 1;
+    console.log(`  ${okNative ? '✓' : '✗'} 公开接口没搜到 → 自动改用 Pixiv 原生搜索（backend=${r.backend}，${r.items.length} 条，原生调用 ${nativeCalls} 次）`);
+
+    const beforeOff = nativeCalls;
+    const off = await px.searchPixiv('冷门关键词', { limit: 2, fetchText: fakeFetch, nativeFallback: false });
+    const okOff = off.backend === 'none' && off.items.length === 0 && nativeCalls === beforeOff;
+    if (!okOff) bad += 1;
+    console.log(`  ${okOff ? '✓' : '✗'} nativeFallback=false 时不碰原生搜索（backend=${off.backend}，原生调用累计 ${nativeCalls} 次）`);
+  } else {
+    bad += 1;
+    console.log(`  ✗ 找不到工具源码 ${pixivCorePath}`);
+  }
+
+  // ⑦ 失败原因必须**分得清**：不能把"Pixiv 上真的没这个标签"说成"要挂代理"
+  //    （2026-10-18 真实误诊：代理开着、原生搜索也跑通了，只是没有这个标签，
+  //      旧规则却回了"先挂上代理再让我试"）
+  const failTextCases = [
+    ['Pixiv 上真的没结果', '没有搜到作品（内置接口（tag）没有结果；内置接口（keyword）没有结果；Pixiv 原生搜索也没有结果）', /Pixiv 上也没搜到/],
+    ['原生搜索连不上', '没有搜到作品（内置接口（tag）没有结果；Pixiv 原生搜索失败：网络错误：连接被拒绝（ECONNREFUSED））', /代理/],
+    ['原生搜索被风控', '没有搜到作品（内置接口（tag）没有结果；Pixiv 原生搜索失败：HTTP 403：https://x）', /风控/],
+    ['公开接口自己就超时', '内置接口（tag）失败：请求超时（20000ms）', /超时|代理/],
+    // 2026-10-18 误诊：工具的**横幅**里带"系统代理"四个字，老规则一看"代理"就判"连不上"，
+    // 可用户代理开着、请求也确实走了代理。含"代理"但没有任何连接类证据时不许怪代理。
+    ['横幅里有"代理"两个字（不是故障）', 'ⓘ 检测到系统代理 http://127.0.0.1:7897，内置下载引擎将走它 | ⓘ 搜索 Pixiv：奶蛙（最多 2 个作品）', /^(?!.*要挂代理).*/],
+    ['反代 500 取不到图', '✖ 「奶蛙」 by Hood 失败：图片反代上没取到任何图片（113355109）', /反代/]
+  ];
+  for (const [label, raw, want] of failTextCases) {
+    const got = mod.searchFailureText(raw);
+    const ok = want.test(got);
+    if (!ok) bad += 1;
+    console.log(`  ${ok ? '✓' : '✗'} 失败分类（${label}）：${got}`);
+  }
+
   console.log(bad === 0 ? '\nPASS 搜图处理方式检查通过' : `\nFAIL ${bad} 项`);
   process.exitCode = bad === 0 ? 0 : 1;
 }
+
+
 
 // ── 真实网络：跑一遍搜图工具，验证"当前模式下到底往群里发了什么" ─────────────
 // 用法：node qqagent-plugin/verify.mjs --search-live
@@ -405,6 +603,275 @@ if (process.argv.includes('--search-live')) {
   process.exitCode = ok ? 0 : 1;
 }
 
+// ── 真实网络：直播录制（达到上限就收尾发送，不能无限录到超时）──────────────────
+//
+// 2026-10-17 真实现场：群友发 `https://b23.tv/8FCCLtv`（短链，302 之后才是
+// `live.bilibili.com`），插件靠 `looksLive(url)` 判断 → 判 false → **既没传 `--live`
+// 也没传 `--live-seconds`** → 工具进了内置录制引擎却"录到手动结束"，一路录到插件自己的
+// timeoutSec 被杀，留下 213MB 的 `.flv.part`，群里只收到一句"下载超时"。
+// 这条用例守着"短链也必须带上录制上限、而且到点就收尾成可播放文件再发出去"。
+if (process.argv.includes('--live')) {
+  const LIVE_URL = process.env.LIVE_URL || 'https://b23.tv/8FCCLtv';
+  const SECS = Math.max(5, Number(process.env.LIVE_SECS) || 15);
+  console.log(`\n=== 真实直播录制（上限 ${SECS} 秒，${LIVE_URL}）===`);
+  Object.assign(settings, { allowLive: true, liveSeconds: SECS, timeoutSec: 60 });
+  const before = sent.length;
+  const t0 = Date.now();
+  const r = await mod.providers['media.download']({
+    url: LIVE_URL, sender, kind: 'group', chatId: '10001', text: LIVE_URL
+  });
+  const secs = (Date.now() - t0) / 1000;
+  const newSends = sent.slice(before);
+  const videoSeg = newSends
+    .flatMap((x) => x.segments || [])
+    .find((s) => s.type === 'video' || s.type === 'file');
+  const filePath = (() => {
+    const uri = String(videoSeg?.data?.file || '');
+    try {
+      return uri.startsWith('file://') ? decodeURIComponent(uri.replace(/^file:\/\/\//, '')) : uri;
+    } catch {
+      return uri;
+    }
+  })();
+  const fileOk = filePath ? fs.existsSync(filePath) && fs.statSync(filePath).size > 0 : false;
+  const logsAll = capturedLogs.join('\n');
+  const sawLive = /直播|录制/.test(logsAll);
+  const sawCap = new RegExp(`录制时长上限`).test(logsAll);
+
+  // 判定：① 认领并成功；② 用时明显短于 timeoutSec（说明是"到点收尾"而不是被超时杀掉）；
+  //       ③ 真的发出了媒体段且文件在磁盘上；④ 日志里出现过录制上限那句话。
+  const ok =
+    !r?.skip && r?.ok !== false && secs < 55 && Boolean(videoSeg) && fileOk && sawLive;
+  if (!ok) bad += 1;
+  console.log(
+    `  ${ok ? '✓' : '✗'} 录制 ${SECS}s 后收尾发送：用时 ${secs.toFixed(1)}s（应 < 55s），` +
+      `返回 ${JSON.stringify({ ok: r?.ok, error: r?.error })}，媒体段 ${videoSeg ? videoSeg.type : '无'}，` +
+      `文件存在 ${fileOk}，日志提到直播 ${sawLive}${sawCap ? '／上限' : ''}`
+  );
+  console.log(ok ? '\nPASS 直播录制检查通过' : '\nFAIL 直播录制检查未通过');
+  process.exitCode = ok ? 0 : 1;
+}
+
+// ── Edge cookie（登录态继承）：解密/格式/真实读取 ─────────────────────────────
+//
+// 2026-10-17 新增功能：以前登录态只能靠"桌面版内置浏览器登录后导出文件"，而大家平时是在
+// Edge 里登录 B 站的。`edge-cookies.mjs` 直接把 Edge 的 cookie 库读出来（DPAPI 解密钥 +
+// AES-256-GCM 解密），转成 Netscape 文件给工具用。
+// 这条用例：① 造一条 v10 cookie 验解密对不对；② 验 v20 会被如实跳过；③ 验 Netscape 格式；
+// ④ 真去读一次本机 Edge（读不到/被锁/全是 v20 都只报告不判失败 —— 那是环境问题不是代码问题）。
+if (process.argv.includes('--edge')) {
+  console.log('\n=== Edge cookie（登录态继承）===');
+  const modPath = path.join(APP_DIR, 'plugins', 'video-downloader', 'edge-cookies.mjs');
+  const srcModPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'video-downloader', 'edge-cookies.mjs');
+  const sameMod = fs.existsSync(modPath) && fs.existsSync(srcModPath)
+    && fs.readFileSync(modPath, 'utf8') === fs.readFileSync(srcModPath, 'utf8');
+  if (!sameMod) bad += 1;
+  console.log(`  ${sameMod ? '✓' : '✗'} 部署副本与源码一致（edge-cookies.mjs）${sameMod ? '' : '（跑一次 deploy.cmd）'}`);
+
+  const m = await import(pathToFileURL(srcModPath).href);
+  const crypto = await import('node:crypto');
+
+  // ① v10 = nonce(12) + 密文 + tag(16)，AES-256-GCM
+  const key = crypto.randomBytes(32);
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
+  const plain = Buffer.from('SESSDATA=fake-session-value; path=/', 'utf8');
+  const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const blob = Buffer.concat([Buffer.from('v10', 'latin1'), nonce, ct, cipher.getAuthTag()]);
+  const dec = m.decryptChromiumCookie(blob, key);
+  const ok1 = dec.ok === true && dec.value === plain.toString('utf8');
+  if (!ok1) bad += 1;
+  console.log(`  ${ok1 ? '✓' : '✗'} v10（AES-256-GCM）解密：${ok1 ? '明文一致' : JSON.stringify(dec)}`);
+
+  // ② v20（Edge 127+ app-bound）必须**如实跳过**，不能假装解出来
+  const v20 = Buffer.concat([Buffer.from('v20', 'latin1'), crypto.randomBytes(40)]);
+  const r20 = m.decryptChromiumCookie(v20, key);
+  const ok2 = r20.ok === false && r20.reason === 'v20';
+  if (!ok2) bad += 1;
+  console.log(`  ${ok2 ? '✓' : '✗'} v20（app-bound 加密）如实标记为解不开：${JSON.stringify(r20)}`);
+
+  // ③ Netscape 格式：带点域名 / #HttpOnly_ 前缀 / 1601 微秒时间戳换算
+  const rows = [
+    { host_key: '.bilibili.com', name: 'SESSDATA', value: 'abc123', path: '/', is_secure: 1, is_httponly: 1, expires_utc: 13300000000000000 },
+    { host_key: 'api.bilibili.com', name: 'buvid3', value: 'xyz', path: '/', is_secure: 0, is_httponly: 0, expires_utc: 0 }
+  ];
+  const netscape = m.toNetscape(rows, { now: 1700000000000 });
+  const lines = netscape.split('\n').filter((l) => l && !l.startsWith('# '));
+  const first = lines[0] || '';
+  const second = lines[1] || '';
+  const ok3 = netscape.startsWith('# Netscape HTTP Cookie File')
+    && first.startsWith('#HttpOnly_.bilibili.com\tTRUE\t/\tTRUE\t')
+    && first.includes('\tSESSDATA\tabc123')
+    && second.startsWith('.api.bilibili.com\tFALSE\t/\tFALSE\t')
+    && second.includes('\tbuvid3\txyz');
+  if (!ok3) bad += 1;
+  console.log(`  ${ok3 ? '✓' : '✗'} Netscape 格式（首行 ${JSON.stringify(first.slice(0, 46))}…）`);
+
+  // ④ 域名过滤
+  const ok4 = m.hostMatches('.bilibili.com', m.DEFAULT_HOSTS)
+    && m.hostMatches('api.bilibili.com', m.DEFAULT_HOSTS)
+    && !m.hostMatches('evil-bilibili.com.example', m.DEFAULT_HOSTS)
+    && !m.hostMatches('.google.com', m.DEFAULT_HOSTS);
+  if (!ok4) bad += 1;
+  console.log(`  ${ok4 ? '✓' : '✗'} 域名后缀匹配（bilibili.com 命中、相似域名不误伤）`);
+
+  // ⑤ 真读一次本机 Edge（只报告，不判失败：Edge 可能开着/没装/没登录/全是 v20）
+  const outFile = path.join(os.tmpdir(), `vgrab-edge-verify-${Date.now()}.txt`);
+  const real = await m.exportEdgeCookies({ outFile, hosts: m.DEFAULT_HOSTS, log: () => {} });
+  let realNote;
+  if (real.ok) {
+    const size = fs.existsSync(outFile) ? fs.statSync(outFile).size : 0;
+    realNote = `导出 ${real.exported} 条（配置 ${real.profile}，文件 ${size} 字节，v20 跳过 ${real.skippedV20 || 0} 条）`;
+    try { fs.unlinkSync(outFile); } catch { /* ignore */ }
+  } else {
+    realNote = real.locked ? 'Edge 正在运行（cookie 库被独占，属正常现象）' : String(real.error || '未知原因');
+  }
+  console.log(`  · 本机 Edge 实测：${realNote}`);
+
+  const allOk = ok1 && ok2 && ok3 && ok4 && sameMod;
+  if (!allOk) bad += 1;
+  console.log(allOk ? '\nPASS Edge cookie 检查通过' : '\nFAIL Edge cookie 检查未通过');
+  process.exitCode = allOk ? 0 : 1;
+}
+
+// ── 本地确定性测试：下载队列（多条链接同时进来不能丢）──────────────────────────
+//
+// 2026-10-17 用户报「同时收到两个视频链接只会下载一条」。根因是两处状态挂在模块作用域：
+//   · 第二条链接在 `waiting` 里排队，热重载 `dispose()` 里的 `waiting.length = 0`
+//     把那个 Promise 直接丢掉 —— 永不 resolve，视频人间蒸发；
+//   · `recent/running` 每个实例一份，换实例后同一链接可能被重下。
+// 现在状态挂在全局符号上、dispose 不再清队列。这条用例用"睡一会儿就返回假 JSON"的假工具，
+// 把三种情形都压一遍（不需要网络）。
+if (process.argv.includes('--queue')) {
+  console.log('\n=== 下载队列（多条链接、热重载中也不能丢任务）===');
+  const box = fs.mkdtempSync(path.join(os.tmpdir(), 'vgrab-queue-test-'));
+  const fakeTool = path.join(box, 'tool');
+  const fakeOut = path.join(box, 'out');
+  fs.mkdirSync(path.join(fakeTool, 'src'), { recursive: true });
+  fs.mkdirSync(fakeOut, { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeTool, 'src', 'cli.js'),
+    [
+      "const fs=require('fs'),path=require('path');",
+      'const argv=process.argv.slice(2);',
+      'const out=argv[argv.indexOf("-o")+1];',
+      'const ticks=Number(process.env.FAKE_TICKS||8);',
+      'new Promise((r)=>{let i=0;const t=setInterval(()=>{i++;if(i>=ticks){clearInterval(t);r();}},100);}).then(()=>{',
+      // ⚠️ 每个 URL 产出**不同文件名 + 不同字节数**：否则"同一个视频不重复发"那道兜底
+      // 会把测试里两个不同视频当成同一个，用例就会假失败（踩过一次）。
+      '  const url=String(argv[0]||"x");',
+      '  let h=0; for (const ch of url) h=((h*31)+ch.charCodeAt(0))>>>0;',
+      '  const size=1024+(h%512);',
+      '  const f=path.join(out,"clip-"+h.toString(16)+".mp4");',
+      '  fs.writeFileSync(f, Buffer.alloc(size, 7));',
+      '  process.stdout.write(JSON.stringify([{ok:true,filePath:f,bytes:size,title:"fake",engine:"fake"}])+"\\n");',
+      '});'
+    ].join('\n'),
+    'utf8'
+  );
+  const keep = { toolRoot: settings.toolRoot, outDir: settings.outDir, concurrency: settings.concurrency, notifySuccess: settings.notifySuccess };
+  Object.assign(settings, { toolRoot: fakeTool, outDir: fakeOut, concurrency: 1, notifySuccess: false, notifyFailure: true });
+  process.env.FAKE_TICKS = '8';   // 每个任务约 0.8 秒
+
+  const mediaCalls = [];
+  const queueSender = {
+    async sendMedia(chatKey, segments) { mediaCalls.push(segments.length); return { message_id: 1 }; },
+    async sendTextBatch() {},
+    async sendImage() {}
+  };
+  const callUrl = (url, chatId = '10001') => mod.providers['media.download']({ url, sender: queueSender, kind: 'group', chatId, text: url });
+  const settle = (p, ms, label) => Promise.race([p, new Promise((r) => setTimeout(() => r({ timeout: label }), ms))]);
+
+  // ① 两条链接并发（不重载）
+  let before = mediaCalls.length;
+  const r1 = await Promise.all([
+    settle(callUrl('https://b23.tv/QUEUEAAA1'), 20000, 'A1'),
+    settle(callUrl('https://b23.tv/QUEUEBBB2'), 20000, 'B2')
+  ]);
+  const ok1 = r1.every((x) => x && x.ok === true) && mediaCalls.length - before === 2;
+  if (!ok1) bad += 1;
+  console.log(`  ${ok1 ? '✓' : '✗'} 两条链接并发：${r1.map((x) => (x && x.ok ? 'ok' : JSON.stringify(x))).join(' / ')}，媒体发送 ${mediaCalls.length - before} 次（应 2）`);
+
+  // ② **不同群**贴同一条链接 → 两个群各要一份，都得下
+  //    （2026-10-17 用户报"不同群的同一条链接只识别了其中一个下载"：去重键原来只有 url，
+  //      A 群下了之后 B 群被判成"刚处理过"直接跳过。现在键是 `会话::链接`。）
+  before = mediaCalls.length;
+  const sameUrl = 'https://b23.tv/QUEUESHARE';
+  const g1 = await callUrl(sameUrl, '20001');
+  const g2 = await callUrl(sameUrl, '20002');
+  const ok2 = g1 && g1.ok === true && g2 && g2.ok === true && mediaCalls.length - before === 2;
+  if (!ok2) bad += 1;
+  console.log(`  ${ok2 ? '✓' : '✗'} 不同群同一条链接各下一份：群A ${JSON.stringify(g1?.ok ?? g1)}，群B ${JSON.stringify(g2?.ok ?? g2)}，媒体发送 ${mediaCalls.length - before} 次（应 2）`);
+
+  // ③ 同一个群里同一条链接短时间重复 → 只处理一次（必须在 ④ 之前：④ 会 dispose 这个实例，
+  //    dispose 之后它按设计不再认领新链接，那正是它该有的行为）
+  before = mediaCalls.length;
+  const dupUrl = 'https://b23.tv/QUEUEEEE5';
+  const first = await callUrl(dupUrl);
+  const dup = await callUrl(dupUrl);
+  const ok3 = first && first.ok === true && dup && dup.skip === true && mediaCalls.length - before === 1;
+  if (!ok3) bad += 1;
+  console.log(`  ${ok3 ? '✓' : '✗'} 同群同链接 10 分钟内只处理一次（第一次 ${JSON.stringify(first)}，第二次 ${JSON.stringify(dup)}，媒体发送 ${mediaCalls.length - before} 次）`);
+
+  // ③b 同一条链接的**不同写法**（带分享参数 / 不带）也必须只下一次、只发一次
+  //     （2026-10-17 一天两次"同一个视频发了两遍"：一条消息里同时有
+  //       `https://b23.tv/X?share_medium=…&ts=…` 和 `https://b23.tv/X`）
+  const keyA = mod.canonicalUrlKey('https://b23.tv/EkiPKno?share_medium=android&share_source=qq&bbid=ABCDEF&ts=1792234427801');
+  const keyB = mod.canonicalUrlKey('https://b23.tv/EkiPKno');
+  const keyC = mod.canonicalUrlKey('https://www.bilibili.com/video/BV1xx411c7mD/?p=2&spm_id_from=333.999&vd_source=abc');
+  const keyD = mod.canonicalUrlKey('https://www.bilibili.com/video/BV1xx411c7mD/?p=3&spm_id_from=333.999');
+  const keyOk = keyA === keyB && keyC !== keyD && keyC.includes('p=2') && !keyC.includes('spm_id_from');
+  if (!keyOk) bad += 1;
+  console.log(`  ${keyOk ? '✓' : '✗'} 链接归一化：分享参数不影响去重（${keyA}），分 P 仍然区分（${keyC} ≠ ${keyD}）`);
+
+  before = mediaCalls.length;
+  const a1 = await callUrl('https://b23.tv/QUEUEFORM1?share_medium=android&share_source=qq&bbid=XYZ&ts=1792234427801', '30001');
+  const a2 = await callUrl('https://b23.tv/QUEUEFORM1', '30001');
+  const ok3b = a1 && a1.ok === true && a2 && a2.skip === true && mediaCalls.length - before === 1;
+  if (!ok3b) bad += 1;
+  console.log(`  ${ok3b ? '✓' : '✗'} 同群"带分享参数 / 干净短链"只下一次（第一次 ${JSON.stringify(a1?.ok ?? a1)}，第二次 ${JSON.stringify(a2)}，媒体发送 ${mediaCalls.length - before} 次）`);
+
+  // ③c 同一个视频即使被**不同链接**触发，发送端也只发一次（按 会话+文件名+字节数 兜底）
+  before = mediaCalls.length;
+  const sameVideo = { dir: box, video: path.join(box, 'clip.mp4'), audio: '', images: [], other: '' };
+  const fakeSender = {
+    async sendMedia() {
+      mediaCalls.push(1);
+      return { message_id: 1 };
+    },
+    async sendTextBatch() {},
+    async sendImage() {}
+  };
+  if (!fs.existsSync(sameVideo.video)) fs.writeFileSync(sameVideo.video, Buffer.alloc(4096, 5));
+  const d1 = await mod.deliver({ sender: fakeSender, chatKey: 'group:30002', artifacts: sameVideo, url: 'x1', title: 't', c: settings, log: () => {} });
+  const d2 = await mod.deliver({ sender: fakeSender, chatKey: 'group:30002', artifacts: sameVideo, url: 'x2', title: 't', c: settings, log: () => {} });
+  const ok3c = /已发送视频/.test(String(d1)) && /已跳过/.test(String(d2)) && mediaCalls.length - before === 1;
+  if (!ok3c) bad += 1;
+  console.log(`  ${ok3c ? '✓' : '✗'} 同一个视频第二次不再发（${JSON.stringify(d1)} → ${JSON.stringify(d2)}，媒体发送 ${mediaCalls.length - before} 次）`);
+
+  // ④ 第二条还在排队时热重载（dispose）—— 绝不能丢任务。**必须放最后**：dispose 不可逆
+  before = mediaCalls.length;
+  const p2a = callUrl('https://b23.tv/QUEUECCC3');
+  const p2b = callUrl('https://b23.tv/QUEUEDDD4');
+  await new Promise((r) => setTimeout(r, 150));   // 让第一条占住 slot，第二条进队列
+  mod.dispose();
+  const r2 = await Promise.all([settle(p2a, 20000, 'C3'), settle(p2b, 20000, 'D4')]);
+  const ok4 = r2.every((x) => x && x.ok === true) && mediaCalls.length - before === 2;
+  if (!ok4) bad += 1;
+  console.log(`  ${ok4 ? '✓' : '✗'} 排队期间热重载：${r2.map((x) => (x && x.ok ? 'ok' : JSON.stringify(x))).join(' / ')}，媒体发送 ${mediaCalls.length - before} 次（应 2；dispose 清空队列会变成 1 且卡住不返回）`);
+
+  const allQueueOk = ok1 && ok2 && ok3 && ok4;
+  delete process.env.FAKE_TICKS;
+  Object.assign(settings, keep);
+  try {
+    fs.rmSync(box, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+  console.log(allQueueOk ? '\nPASS 下载队列检查通过' : '\nFAIL 下载队列检查未通过');
+  process.exitCode = allQueueOk ? 0 : 1;
+}
+
 // ── 本地确定性测试：确定性搜图指令（「我要 xxx 的图」→ 0 token 直接搜图）──────
 if (process.argv.includes('--cmd')) {
   console.log('\n=== 确定性搜图指令（0 token）===');
@@ -435,7 +902,12 @@ if (process.argv.includes('--cmd')) {
     ['来张猫娘的图', '猫娘', 0],
     ['有没有猫娘的图', '猫娘', 0],
     ['来3张猫娘的图', '猫娘', 3],
-    ['@小鲸鱼(QQ:1) 我要猫娘的图', '猫娘', 0]
+    ['@小鲸鱼(QQ:1) 我要猫娘的图', '猫娘', 0],
+    // 2026-10-18 现场：「来点レイジ的图」被判"句式不匹配" —— 关键词校验只认汉字/拉丁，
+    // 假名（还有韩文/俄文）全被当成"没内容"。pixiv 的标签绝大多数是日文，这条必须过。
+    ['来点レイジ的图', 'レイジ', 0],
+    ['@陈千语 来点レイジ的图', 'レイジ', 0],
+    ['来点ゆかり的图', 'ゆかり', 0]
   ];
   for (const [text, kw, count] of hitCases) {
     const r = matcher.matchSearchCommand(text);
@@ -465,24 +937,25 @@ if (process.argv.includes('--cmd')) {
   }
   const hookInstalled = await mod.installOrchestratorHook();
   const hasHook = typeof proto?.onIncoming === 'function';
-  const marked = proto?.[Symbol.for('qq-agent.video-downloader.orch.onIncoming')];
   const okHook = hookInstalled === true && hasHook;
   if (!okHook) bad += 1;
-  console.log(
-    `  ${okHook ? '✓' : '✗'} 运行时钩子已挂上 onIncoming` +
-      (marked ? `（原方法已备份：${typeof marked.original === 'function' ? '是' : '否'}）` : '')
-  );
+  console.log(`  ${okHook ? '✓' : '✗'} 运行时钩子已挂上 onIncoming`);
 
   if (okHook) {
     // 用一个探针当"原方法"，验证：命中的消息被 veto（探针**不该**被调用）、不命中的照常转交
     mod.uninstallOrchestratorHook();
     const savedOnIncoming = proto.onIncoming;
     let probeCalls = 0;
-    proto.onIncoming = function probeOnIncoming() { probeCalls += 1; return 'probe'; };
+    const probeOnIncoming = function probeOnIncoming() { probeCalls += 1; return 'probe'; };
+    proto.onIncoming = probeOnIncoming;
     await mod.installOrchestratorHook();
+    // install 时那次"链上还调得到我吗"的探测会落到这个假原方法上一次（链上还没有壳），
+    // 那是安装动作不是消息，归零后再数消息。
+    probeCalls = 0;
 
     // 假编排器：只要 store.markEntryRead / sender 两个东西
     const read = new Set();
+    const notices = [];        // 插件"自己发出去的话"（失败提示等）
     const fakeOrch = {
       store: {
         markEntryRead(chatKey, id) {
@@ -492,7 +965,10 @@ if (process.argv.includes('--cmd')) {
           return true;
         }
       },
-      sender: { async sendMedia() { return { message_id: 1 }; }, async sendTextBatch() {} },
+      sender: {
+        async sendMedia() { return { message_id: 1 }; },
+        async sendTextBatch(chatKey, lines) { notices.push({ chatKey, lines: Array.isArray(lines) ? lines : [lines] }); }
+      },
       onebot: { selfId: '1' }
     };
     Object.assign(settings, { toolRoot: path.join(os.tmpdir(), 'vgrab-nonexistent-toolroot'), searchCommand: true, searchSendMode: 'download' });
@@ -516,6 +992,18 @@ if (process.argv.includes('--cmd')) {
     if (!fallbackOk) bad += 1;
     console.log(`  ${fallbackOk ? '✓' : '✗'} 标已读失败时不 veto（原方法被调用，交给模型）`);
 
+    // 搜图失败必须回话（2026-10-18 用户报"pixiv 搜图失败没有在群内反馈"）：
+    // 命中后消息被 veto、模型不会出场，工具又是不存在的目录 → 必定失败。
+    // 这时插件必须自己往群里发一句失败原因，否则用户只看到"发了指令没人理"。
+    await sleep(1200);
+    const noticeLines = notices.flatMap((n) => n.lines || []);
+    const failNoticeOk = noticeLines.some((l) => /搜图|下载工具|失败|Pixiv/.test(String(l)));
+    if (!failNoticeOk) bad += 1;
+    console.log(
+      `  ${failNoticeOk ? '✓' : '✗'} 指令失败会回话：${noticeLines.length ? JSON.stringify(noticeLines.slice(0, 2)) : '（什么都没发）'}`
+    );
+    notices.length = 0;
+
     mod.uninstallOrchestratorHook();
     proto.onIncoming = savedOnIncoming;
     await mod.installOrchestratorHook();   // 探针撤掉后把真钩子装回来，后面的检查按"钩子在位"走
@@ -532,6 +1020,28 @@ if (process.argv.includes('--cmd')) {
     if (!implIndirectOk) bad += 1;
     console.log(`  ${implIndirectOk ? '✓' : '✗'} 链环走"当前实现"指针（换成第三份实现也立刻生效，原方法未被调用）`);
     globalThis[IMPL_KEY] = savedImpl;
+
+    // 热重载自愈（2026-10-17 真实现场）：**dispose 不许摘壳**。
+    // 当时的表现是"指令发出去没日志、没图、没反应"：新旧实例的 install / dispose 在同
+    // 一秒里交错，旧实例 dispose 读到的是新实例刚写下的记录，把新实例的壳当成自己的
+    // 还原掉 —— 链上只剩原方法，连"未认领"都打不出来，根本没法查。
+    const shellBefore = proto.onIncoming;
+    mod.uninstallOrchestratorHook();
+    const shellKept = proto.onIncoming === shellBefore;
+    if (!shellKept) bad += 1;
+    console.log(`  ${shellKept ? '✓' : '✗'} dispose 不摘壳（壳留着无害，摘了就会静默失效）`);
+
+    // 万一壳真的不在了（旧版本留下的、或别的插件还原错），install 必须自己挂回来
+    proto.onIncoming = probeOnIncoming;               // 模拟"链上只剩原方法"
+    const healed = await mod.installOrchestratorHook();
+    probeCalls = 0;                                   // 同上：install 里那次探测不算消息
+    const healEntry = { id: 21, self: false, text: '我要猫娘的图', atNames: [], atMe: false, senderId: '1', senderName: '测试' };
+    proto.onIncoming.call(fakeOrch, 'group:10001', healEntry);
+    const healOk = healed === true && read.has('group:10001#21') && probeCalls === 0;
+    if (!healOk) bad += 1;
+    console.log(
+      `  ${healOk ? '✓' : '✗'} 壳被摘掉后 install 自愈重挂（命中照旧 veto，原方法被调 ${probeCalls} 次，应 0）`
+    );
   }
 
   // ③ 备用路径：核心若打了 image-request 补丁就报个状态（没打是正常的，不影响上面那条）
@@ -614,7 +1124,7 @@ if (process.argv.includes('--cmd')) {
       `fs.mkdirSync(dir,{recursive:true});\n` +
       `fs.writeFileSync(path.join(dir,'001.png'),Buffer.alloc(4096,1));\n` +
       `fs.writeFileSync(path.join(dir,'002.png'),Buffer.alloc(4096,2));\n` +
-      `process.stdout.write(JSON.stringify([{ok:true,pid:'123456',title:kw,author:'测试作者',files:[path.join(dir,'001.png'),path.join(dir,'002.png')],bytes:8192,dir}])+'\\n');\n`,
+      `process.stdout.write(JSON.stringify([{ok:true,pid:'123456',title:kw,author:'测试作者',files:[path.join(dir,'001.png'),path.join(dir,'002.png')],bytes:8192,dir,backend:'lolicon/tag'}])+'\\n');\n`,
     'utf8'
   );
 
@@ -673,7 +1183,8 @@ if (process.argv.includes('--cmd')) {
     console.log(`  ${ok ? '✓' : '✗'} ${label} → ${JSON.stringify(r)}（应为 skip）`);
   }
 
-  // ⑥ send 模式：收到指令先发「开始搜图了」，图片发完再发「搜图结束了」，中间没有别的文字
+  // ⑥ send 模式：收到指令先发「开始搜图了」，图下好后、发图**之前**发「图片正在发送」
+  //    （2026-10-19 用户要求：这句是"图马上来"的预告，必须在图片前面；图后不再收尾）
   Object.assign(settings, { searchCommand: true, searchSendMode: 'send', toolRoot: fakeRoot, outDir: fakeOut });
   const order = [];
   const sendSender = {
@@ -687,18 +1198,41 @@ if (process.argv.includes('--cmd')) {
   };
   const rSend = await mod.handleImageRequest({    text: '来张猫娘的图', kind: 'group', chatId: '10001', chatKey: 'group:10001', sender: sendSender, atNames: [], atOthers: false
   });
-  for (let i = 0; i < 40 && !order.some((x) => x.startsWith('text:搜图结束了')); i += 1) await sleep(250);
+  // 等到图片发出来再断言（图片是一张一条，来源说明在它们之后，单独用单元断言验证）
+  for (let i = 0; i < 40 && !order.some((x) => x.startsWith('media:image')); i += 1) await sleep(250);
+  // 2026-10-18 起图片是**一张一条消息**发（一批多图会让整条消息被 QQ 丢掉，见 README），
+  // 所以这里断言的是"顺序"：开始 → 正在发送 → 每张图各一条（后面不再有文字）。
+  // 2026-10-19 起两句固定话都带关键词（`开始搜图了：猫娘`），避免被发送管道的 8 秒去重吃掉。
+  const mediaCount = order.filter((x) => x.startsWith('media:image')).length;
+  // 顺序断言：开始 → 图片正在发送 → 每张图各一条。
+  // 「来源说明」那句单独用**单元断言**（backendNoteText）验证 —— 它依赖工具 JSON 里的 backend，
+  // 而这里的假工具不保证字段齐全，放进顺序断言会变成"测假数据"而不是测行为。
   const okSend =
     rSend?.handled === true &&
-    order.length === 3 &&
-    order[0] === 'text:开始搜图了' &&
-    order[1].startsWith('media:image') &&
-    order[2] === 'text:搜图结束了';
+    order.length >= 3 &&
+    order[0].startsWith('text:开始搜图了') &&
+    order[0].includes('猫娘') &&
+    order[1].startsWith('text:图片正在发送') &&
+    order[1].includes('猫娘') &&
+    mediaCount >= 1 &&
+    order.slice(2).every((x) => x.startsWith('media:image'));
   if (!okSend) bad += 1;
+  // 来源说明的三档文案（2026-10-19 用户要求：图发完后自动说一句走的是哪条搜索路）
+  const noteCases = [
+    ['pixiv-native', 'Pixiv 官方搜索'],
+    ['lolicon/tag', '第三方聚合接口'],
+    ['缓存（3 分钟前搜过）', '缓存']
+  ];
+  for (const [backend, want] of noteCases) {
+    const got = mod.backendNoteText(backend, '猫娘');
+    const ok = got.includes(want) && got.includes('猫娘');
+    if (!ok) bad += 1;
+    console.log(`  ${ok ? '✓' : '✗'} 来源说明（${backend}）→ ${got}`);
+  }
   console.log(`  ${okSend ? '✓' : '✗'} send 模式顺序：${order.join(' → ') || '(什么都没发)'}`);
-  // 这两句必须是**插件自己通过发送管道直接发**（不经过模型）：上面用的就是 sender 探针，
+  // 两句固定话必须是**插件自己通过发送管道直接发**（不经过模型）：上面用的就是 sender 探针，
   // 能收到 text 说明走的是 ctx.sender.sendTextBatch；而固定句式那条路模型根本不会被叫醒（veto）。
-  const directOk = order.filter((x) => x.startsWith('text:')).length === 2;
+  const directOk = order.filter((x) => x.startsWith('text:')).length >= 2;
   if (!directOk) bad += 1;
   console.log(`  ${directOk ? '✓' : '✗'} 两句固定话由插件直接发出（sender.sendTextBatch，不经模型）`);
 

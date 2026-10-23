@@ -1,7 +1,7 @@
 {
   "id": "video-downloader",
   "name": "视频下载（肥鱼当劳）",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "apiVersion": 1,
   "category": "media",
   "description": "群里出现视频/图文链接 → 自动用本机的「肥鱼当劳（ds-download）」（源码目录 D:\\视频下载工具）把它下下来，然后把视频（或图文帖的图片）发回当前会话。\n\n【为什么是插件】核心 src/media-links.js 已经把这件事做成了**确定性调度**：它从消息里抽出候选链接，逐个问所有 media.download 提供者「谁认领谁处理」，全程不经过模型。规则能写死 = 插件；放进 skills/ 会因为「模型看不到 providers」而静默失效。\n\n【支持什么】已知平台：B站（含 b23.tv 短链、专栏 cv、图文 opus、直播）、抖音（视频/图文/短链）、YouTube、Twitter/X、Instagram、TikTok、快手、小红书、微博、知乎、Pixiv、微信文章 等（这些走工具自带的 yt-dlp + 内置浏览器兜底）；另外**任意直链**（.mp4/.mkv/.webm/.m3u8/.mp3…）也认。工具那边已有的能力（登录 Cookie、代理自动跟随系统代理、直播录制、图文帖逐张翻页、B站专栏只取正文图…）都会照常生效。\n\n【图文帖怎么发】图片默认**前 9 张直接发在群里、剩下的打包成一个 zip 当群文件发**（一张都不丢，也不刷屏）；压缩包名取帖子标题，并用一行文字说明来由。「图片超出上限怎么办」可切成 all（zip 里放全部图）或 off（只发前面几张）。\n\n【Pixiv 不需要代理】pixiv.net 在大陆直连不通，但本插件走的是一条**不需要代理**的路：搜图用公开检索接口（api.lolicon.app），取图用 pixiv.re 反代（实测返回的就是原图，字节数与官方一致，连 Referer 都不用）。所以：① 贴 pixiv 作品链接 → 先试官方接口，失败就自动改用反代（多图作品会把**每一页**逐页补齐）；② 另外注册了一个「Pixiv 搜图（免代理）」工具，群友说「来张初音ミク的图」时模型可以直接搜图 —— 搜到之后是**只下载**（默认，群里不发任何消息）、只发图还是图加说明，由「搜图结果怎么处理」那个设置决定。这也是本插件和「Pixiv 来张图（自建）」那个插件的重叠之处 —— 两者留一个就行。\n\n【发不出去的兜底】视频超过「视频转文件阈值」就改发**群文件**；压缩包超过「压缩包体积上限」就只回一行文字 + 本地路径；再失败（协议端不收、体积超限）也不会静默吞掉。\n\n【下载耗时】视频/图文需要几秒到几分钟（Pixiv、抖音、直播类要等内置浏览器渲染），这段时间不影响聊天：核心对链接转发是「发出去不等」的（app.js 里 forwardLinkedMedia(...).catch(...)），这里再自己串行排队 + 超时兜底，避免把机器和带宽压满。\n\n【去哪看产物】默认保存在 QQ Agent 的 data/video-downloader/ 下（按链接建子目录），可设保留天数自动清理。",
@@ -17,6 +17,10 @@
     "keepDays": 0,
     "acceptLinks": "known+direct",
     "proxy": "",
+    "cookiesSource": "auto",
+    "edgeProfile": "auto",
+    "edgeCookieHosts": "",
+    "edgeCookiesTtlMin": 360,
     "allowLive": true,
     "liveSeconds": 60,
     "quality": "best",
@@ -29,7 +33,10 @@
     "searchSendMode": "download",
     "searchCommand": true,
     "searchCommandMaxLen": 40,
+    "searchBackendNote": true,
+    "skipSentPixiv": true,
     "pixivAllowR18": false,
+    "pixivNodeFailover": false,
     "videoAsFileMb": 100,
     "concurrency": 1,
     "timeoutSec": 300,
@@ -68,6 +75,27 @@
       "type": "string",
       "label": "代理地址（可选）",
       "description": "填了就给下载工具加 --proxy http://127.0.0.1:7897（HTTP 代理，与工具界面里的「代理地址」是同一个东西）。\n\n**留空时**工具会自己跟随 Windows 系统代理（Clash/v2rayN 设的那个）—— 但系统代理开关在换节点/切模式时很容易被关掉，那时 pixiv 这类站点会突然全部失败，报的还是「直连超时」（看着像网络问题，其实是没有代理）。所以要么留空靠自动跟随，要么把这里填上固定走它。\n\n（B站/抖音/YouTube 这些不需要代理也能下；只有 pixiv、YouTube 部分内容才需要。）"
+    },
+    "cookiesSource": {
+      "type": "enum",
+      "values": ["auto", "edge", "file", "off"],
+      "label": "登录态（cookie）从哪来",
+      "description": "下载 B 站会员清晰度、需要登录的站点时要带 cookie。\n\n· **auto（默认）**：先用现成的 cookie 文件（插件自己的 login-cookies.txt / 桌面版导出的那份）；都没有就去 **Microsoft Edge** 里读 —— 你平时在 Edge 里登录过 B 站，机器人就自动继承了登录态，不用再单独导出文件。\n· **edge**：优先从 Edge 读（读不到才退回文件）。\n· **file**：只用现成的 cookie 文件。\n· **off**：不带登录态（只下免登录内容）。\n\n⚠️ Edge **正在运行时**它的 cookie 库是独占的，读不出来（Windows 文件锁）。所以想让机器人拿到最新登录态，**先完全退出 Edge**（托盘也要退），它下次下载时会自动导出一次；导出结果默认缓存 6 小时（见下面「Edge cookie 缓存时长」）。另：Edge 127+ 有一部分 cookie 是 app-bound 加密（v20），外部进程在技术上解不开，那部分会被跳过并在日志里写明条数。"
+    },
+    "edgeProfile": {
+      "type": "string",
+      "label": "Edge 配置文件（留空/auto = 自动）",
+      "description": "Edge 一般有 Default / Profile 1 / Profile 2 等。留空或填 auto：优先用 Default（若它没有 cookie 库则用第一个可用的）；也可以直接写配置名，如 Profile 1。"
+    },
+    "edgeCookieHosts": {
+      "type": "string",
+      "label": "只从 Edge 导出这些域名（留空 = 内置列表）",
+      "description": "逗号或空格分隔，后缀匹配。留空使用内置列表：bilibili.com、b23.tv、douyin.com、iesdouyin.com、pixiv.net、youtube.com、kuaishou.com、weibo.com、x.com、twitter.com、tiktok.com、xiaohongshu.com。\n\n填 * 表示把 Edge 里的 cookie 全部导出（文件会大一些，也会包含别的站点，自己权衡）。"
+    },
+    "edgeCookiesTtlMin": {
+      "type": "number",
+      "label": "Edge cookie 缓存时长（分钟）",
+      "description": "默认 360（6 小时）。导出的 cookie 会写到 data/video-downloader/edge-cookies.txt，在这个时间内直接复用，不会每次下载都去读浏览器。改小了更及时但更频繁地撞 Edge 的文件锁。"
     },
     "allowLive": {
       "type": "boolean",
@@ -115,13 +143,13 @@
     "searchCount": {
       "type": "number",
       "label": "搜图默认下载几个作品",
-      "description": "默认 2（1~5）。模型也可以在调用时自己指定数量（对方说「多来几张」时它会把数量调大）。每个作品下到自己独立子目录，图多时按「图片超出上限怎么办」的规则发。"
+      "description": "默认 2。模型也可以在调用时自己指定数量（对方说「多来几张」时它会把数量调大），**没有硬上限**（最多 500）。每个作品下到自己独立子目录，图多时按「图片超出上限怎么办」的规则发。"
     },
     "searchSendMode": {
       "type": "enum",
       "label": "搜图结果怎么处理",
       "values": ["download", "images", "send"],
-      "description": "收到搜图命令、把图下下来之后怎么办：\n· download（默认）= **只下载**：图留在本机，群里一个字都不发（图也不发），下载情况写在控制台日志和工具返回值里，并明确要求模型也不要发言。适合「只想把图收下来、不想让机器人说话」；\n· images = **只发图**：图（超出上限照旧打包成 zip 当群文件）发到会话，但**不发任何文字**；\n· send = **图 + 两句固定话**：收到指令先发一句「开始搜图了」，图片发完再发一句「搜图结束了」，中间不再发「前 N 张发在上面了…」那种说明文字。想让人一眼看出「在搜了 / 搜完了」就用这个。\n\n**这两句由插件自己直接发**（走核心的发送管道：限频、去重、留档），不是让模型说话 —— 固定句式那条路上模型根本不会被叫醒；模型即使在别的路径里调了搜图工具，返回值里也会明确交代别自己再复述这两句。\n\n注意：这里只管**搜图**这条链路（链接自动转发不受影响）。"
+      "description": "收到搜图命令、把图下下来之后怎么办：\n· download（默认）= **只下载**：图留在本机，群里一个字都不发（图也不发），下载情况写在控制台日志和工具返回值里，并明确要求模型也不要发言。适合「只想把图收下来、不想让机器人说话」；\n· images = **只发图**：图（超出上限照旧打包成 zip 当群文件）发到会话，但**不发任何文字**；\n· send = **图 + 两句固定话**：收到指令先发一句「开始搜图了」，图片发完再发一句「图片正在发送」，中间不再发「前 N 张发在上面了…」那种说明文字。想让人一眼看出「在搜了 / 搜完了」就用这个。\n\n**这两句由插件自己直接发**（走核心的发送管道：限频、去重、留档），不是让模型说话 —— 固定句式那条路上模型根本不会被叫醒；模型即使在别的路径里调了搜图工具，返回值里也会明确交代别自己再复述这两句。\n\n注意：这里只管**搜图**这条链路（链接自动转发不受影响）。"
     },
     "searchCommand": {
       "type": "boolean",
@@ -133,10 +161,25 @@
       "label": "搜图指令的整句长度上限",
       "description": "默认 40（字）。超过这个长度的消息哪怕是「我要…的图」也交给模型 —— 长句子里出现这个句式，多半是真的在说话，不是点图。想让机器人只听短指令就调小（如 20）。"
     },
+    "searchBackendNote": {
+      "type": "boolean",
+      "label": "图后说明这次走的是哪条搜索路",
+      "description": "默认**开**。图片发完后补一句：这次是「Pixiv 官方搜索」还是「第三方聚合接口（lolicon）」还是「上次的缓存」。只影响 `send` / `images` 两种会说话的模式（`download` 模式本来一个字都不发）。关掉就只写日志。"
+    },
+    "skipSentPixiv": {
+      "type": "boolean",
+      "label": "发过的作品不再发",
+      "description": "默认**开**。记住发出去过的作品 pid（`data/video-downloader/sent-pixiv.json`，保留 90 天/最多 2000 条），下次搜图时直接把它们排除掉（**连下载都省了**）。关掉就每搜一次都可能重复发旧图。"
+    },
     "pixivAllowR18": {
       "type": "boolean",
       "label": "允许成人向（Pixiv）",
       "description": "默认关。**管两件事**：① 搜图时只出全年龄作品（会按作品标签二次筛 R-18 / R-18G）；② 有人贴了成人向作品链接时**不把图发到群里**（工具会在取图时顺带反查分级）。\n\n群里**强烈建议保持关闭** —— 这个开关没有按会话的管理员校验，打开就是全局生效。需要按会话分级的话用「Pixiv 来张图（自建）」那个插件（它有主人身份校验）。\n\n注意：反代那条路有时拿不到分级信息，这种情况下按全年龄处理（`pixivRating=0`），也就是说「默认关」并不能 100% 兜住所有成人向链接。"
+    },
+    "pixivNodeFailover": {
+      "type": "boolean",
+      "label": "原生搜索失败时自动换节点",
+      "description": "默认**关**。打开后：Pixiv 原生搜索被代理重置（ECONNRESET）时，工具会通过 Clash 的控制接口，逐个探测候选节点、把代理组切到第一个能连 pixiv 的，然后**重试一次**。⚠️ 它会改你在 Clash 里的全局代理选择（这份订阅最后一条规则是 `MATCH,✈️Final`，所有走代理的流量都会跟着换），而且**换完不会自动换回去** —— 所以默认关，确认能接受再用。"
     },
     "videoAsFileMb": {
       "type": "number",

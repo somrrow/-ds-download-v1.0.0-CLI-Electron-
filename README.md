@@ -40,12 +40,12 @@
 ### 已打包的免安装版（双击 exe）
 
 ```
-dist\ds-download-1.0.0-win-x64\ds-download.exe     ← 双击即可，不需要 Node
+dist\ds-download-1.0.1-win-x64\ds-download.exe     ← 双击即可，不需要 Node
 ```
 
 不用装 Node、不用 npm install，包里自带 Electron 运行时与 yt-dlp/ffmpeg（首启动会自动复制到
 `%APPDATA%\ds-download\tools`）。整个目录拷到哪台 Windows 上都能跑；要发给别人就发
-`dist\ds-download-1.0.0-win-x64.zip`（对方**先解压**再双击 exe；没签名的 exe 第一次打开
+`dist\ds-download-1.0.1-win-x64.zip`（对方**先解压**再双击 exe；没签名的 exe 第一次打开
 可能被 SmartScreen 拦一下，点「更多信息 → 仍要运行」即可）。
 
 自己重新打一份包（改完代码后）：
@@ -216,7 +216,7 @@ dist/                       打包产物（便携目录 + zip）
 `node_modules/electron/dist` 里那份运行时：
 
 ```
-dist/ds-download-1.0.0-win-x64/
+dist/ds-download-1.0.1-win-x64/
   ds-download.exe           ← 双击即开（Electron 运行时改名而来，app.isPackaged = true）
   ds-download.ico           ← 快捷方式/资源管理器图标
   *.dll / icudtl.dat / locales/ …       Electron 运行时

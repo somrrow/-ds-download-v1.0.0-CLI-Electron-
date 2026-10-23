@@ -96,12 +96,20 @@ const JUNK_PATTERN = new RegExp(
  */
 const CONTENT_PATTERNS = [/\/bfs\/article\//i];
 
-/** 页面语义区域标记里，属于「评论/私信」的图片不算正文配图 */
-const JUNK_SCOPE = /comment-item|comment-list|conversation-item|live-avatar/i;
-/** 正文区域标记（抖音图文详情页） */
-const NOTE_SCOPE = /note-detail/i;
-/** 轮播里逐张翻出来的正文图（最可靠，优先只用这些） */
-const SLIDE_SCOPE = /slide/i;
+/**
+ * 页面语义区域标记里，属于「评论/私信」的图片不算正文配图。
+ *
+ * ⚠️ `scope` 有两种形态，正则必须都认（2026-10-17 真实现场，这就是"6 张只下 1 张"的
+ * 最终根因）：页面抽取脚本给的是**短标记** —— `'note' / 'slide' / 'junk' / 'other' / 'plain'`
+ * （见 browser-page.js 的 scopeOf()），而这里原来只按"祖先链里含 note-detail/comment-item"
+ * 这类**e2e 路径片段**去匹配。结果 `NOTE_SCOPE.test('note')` 恒为 false →
+ * `inNote` 永远是空数组 → 正文区域那 6 张全被"收敛"掉，只剩轮播翻出来的 1 张。
+ */
+const JUNK_SCOPE = /^junk$|comment-item|comment-list|conversation-item|live-avatar/i;
+/** 正文区域标记（抖音图文详情页）：短标记 `note` + e2e 路径里的 `note-detail` 都算 */
+const NOTE_SCOPE = /^note$|note-detail/i;
+/** 轮播里逐张翻出来的正文图（带顺序，排在最前）：短标记 `slide` + 路径里的 slide 都算 */
+const SLIDE_SCOPE = /^slide$|slide/i;
 
 /**
  * 识别「图片帖」链接。
@@ -223,14 +231,25 @@ async function resolveImagePost(rawUrl, opts = {}) {
 /**
  * 计算「同一张图」的归一化键：抖音等站点会用 `~tplv-xxx:宽:高.webp` 后缀生成多个尺寸变体，
  * 去掉这部分后就是同一张原图，可以据此去重。
+ *
+ * ⚠️ 主机名也要归一化（2026-10-17）：同一张图会挂在不同 CDN 分片上
+ * （`p3-pc-sign.douyinpic.com` / `p9-pc-sign.douyinpic.com` / `p26-sign.douyinpic.com`…），
+ * 只按 path 去重会漏，结果同一张图被下两遍（一次来自结构化数据、一次来自 DOM/网络请求）。
+ * 所以把"分片前缀"剥掉，只留基础域名。
  */
+const CDN_BASE_DOMAINS = ['douyinpic.com', 'douyinvod.com', 'byteimg.com', 'hdslb.com', 'pximg.net', 'xhscdn.com', 'sinaimg.cn'];
+function baseHost(host) {
+  const h = String(host || '').toLowerCase();
+  for (const d of CDN_BASE_DOMAINS) if (h === d || h.endsWith(`.${d}`)) return d;
+  return h;
+}
 function baseImageKey(url) {
   try {
     const u = new URL(url);
     // `~` 后面是 CDN 的变体后缀（~tplv-xxx:宽:高.webp、~noop.jpeg、~tplv-obj.jpeg…），整段去掉即为同一张原图
     // `@` 后面是 B 站的尺寸后缀（@1192w.webp、@128w_128h_1c、@80w_80h_1c），同样去掉
     const pathname = u.pathname.replace(/~[^/]*$/, '').replace(/@\d+w[^/]*$/i, '');
-    return `${u.host.toLowerCase()}${pathname}`;
+    return `${baseHost(u.host)}${pathname}`;
   } catch {
     return url.split('?')[0];
   }
@@ -307,20 +326,73 @@ function pickPostImages(candidates, opts = {}) {
   }
 
   // 正文图的来源按可靠程度依次收敛：
-  //   1) 抖音图文轮播逐张翻出来的（最准，还带顺序）
+  //   1) 抖音图文轮播逐张翻出来的（带顺序，最准）
   //   2) 抖音「正文区域」里的
   //   3) 命中正文地址特征的（如 B 站专栏的 /bfs/article/）
   // 只要有一路命中，就只认这一路，避免把头像、UI 资源、缩略变体当成正文图存下来。
+  //
+  // ⚠️ 但「轮播」和「正文区域」**要合并**，不能二选一（2026-10-17 真实现场）：
+  // 抖音图文帖的多张图其实是**同时挂在 DOM 里**的（正文区域一眼能看到 6 张），
+  // 而逐张翻页那套逻辑只翻出 1 张（多点了几下没变化就判定到底了）。
+  // 原来"有 slides 就只认 slides"，于是**6 张只下 1 张**。现在：轮播给顺序，
+  // 正文区域给"漏掉的那些"，两者按 去重键 合并；顺序仍是轮播优先、其余按 DOM 顺序。
   const slides = kept.filter((x) => SLIDE_SCOPE.test(x.scope));
   const inNote = kept.filter((x) => NOTE_SCOPE.test(x.scope));
   const byContent = kept.filter((x) => CONTENT_PATTERNS.some((re) => re.test(x.url)));
-  const chosen = slides.length ? slides : inNote.length ? inNote : byContent;
-  const pool = chosen.length ? new Set(chosen.map((x) => x.url)) : null;
 
-  const rows = [...byKey.values()].filter((x) => !pool || pool.has(x.url));
-  // 轮播图要按翻页顺序编号（001 是第一张），其余按「像原图」的分数排
-  if (slides.length) rows.sort((a, b) => a.order - b.order);
-  else rows.sort((a, b) => b.score - a.score);
+  let ordered = [];
+  if (slides.length) {
+    ordered = [...slides];
+    const seen = new Set(slides.map((x) => baseImageKey(x.url)));
+    for (const x of inNote) {
+      const k = baseImageKey(x.url);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      ordered.push(x);
+    }
+  } else if (inNote.length) {
+    ordered = inNote;
+  } else {
+    ordered = byContent;
+  }
+  const chosen = ordered;
+  // ⚠️ 收敛要按**归一化键**比，不能按 URL 全串比（2026-10-17 真实现场）：
+  // 同一张图会以不同查询串/变体出现在结构化数据、网络请求、DOM 里
+  // （`...~tplv-dy-aweme-images:q75.webp?biz_tag=aweme_images&from=3` vs 同一路径的别的签名），
+  // 按 URL 全串比就会把"正文区域里明明在"的 5 张全过滤掉 —— 6 张只下 1 张就是这么来的。
+  const poolKeys = chosen.length ? new Set(chosen.map((x) => baseImageKey(x.url))) : null;
+  const rankOf = new Map();
+  chosen.forEach((x, i) => {
+    const k = baseImageKey(x.url);
+    if (!rankOf.has(k)) rankOf.set(k, i);
+  });
+
+  const rows = [...byKey.values()].filter((x) => !poolKeys || poolKeys.has(baseImageKey(x.url)));
+  // 轮播/正文图按发现顺序编号（001 是第一张），其余按「像原图」的分数排
+  if (slides.length || inNote.length) {
+    rows.sort((a, b) => {
+      const ra = rankOf.has(baseImageKey(a.url)) ? rankOf.get(baseImageKey(a.url)) : 1e9;
+      const rb = rankOf.has(baseImageKey(b.url)) ? rankOf.get(baseImageKey(b.url)) : 1e9;
+      return ra - rb;
+    });
+  } else {
+    rows.sort((a, b) => b.score - a.score);
+  }
+  // 排查「该下的图被过滤掉了」时用：VIDEOGRAB_DEBUG_PICK=1 把各阶段数量打到 stderr
+  if (process.env.VIDEOGRAB_DEBUG_PICK) {
+    try {
+      process.stderr.write(
+        `[pick] candidates=${(candidates || []).length} kept=${kept.length} byKey=${byKey.size} ` +
+          `slides=${slides.length} inNote=${inNote.length} byContent=${byContent.length} ` +
+          `chosen=${chosen.length} chosenKeys=${poolKeys ? poolKeys.size : 0} rows=${rows.length}\n`,
+      );
+      for (const [k, v] of byKey) {
+        process.stderr.write(`[pick] key=${k.slice(-42)} score=${v.score} scope=${v.scope || '-'}\n`);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
   return rows.slice(0, maxImages).map(({ url, width, height, scope }) => ({ url, width, height, scope }));
 }
 
@@ -616,6 +688,8 @@ async function downloadImages(opts) {
         userAgent,
         headers: { ...extraHeaders, ...(referer ? {} : {}) },
         timeout,
+        // 每个 item 可以自带 fetch 实现（pixiv：反代直连 / 官方图床走代理，见 pixiv.js）
+        fetch: item.fetch,
         retries: 2,
         signal,
       });

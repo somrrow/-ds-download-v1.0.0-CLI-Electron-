@@ -585,6 +585,16 @@ async function runPageDumpMode() {
   );
   let report;
   try {
+    // cookie：命令行那边把登录态写成临时 JSON 传过来 —— 有登录态才不容易撞风控/验证码页
+    let cookies = null;
+    const cookiesFile = process.env.VIDEOGRAB_PAGE_COOKIES;
+    if (cookiesFile) {
+      try {
+        cookies = JSON.parse(fs.readFileSync(cookiesFile, 'utf8'));
+      } catch {
+        cookies = null;
+      }
+    }
     const res = await extractPageMediaInProcess(
       { BrowserWindow, session },
       {
@@ -592,6 +602,7 @@ async function runPageDumpMode() {
         waitSec: Number(process.env.VIDEOGRAB_PAGE_WAIT || 10),
         loadImages: process.env.VIDEOGRAB_PAGE_IMAGES === '1',
         scroll: process.env.VIDEOGRAB_PAGE_SCROLL === '1',
+        cookies,
         onLog: (m) => {
           trace(m);
           console.log(m);

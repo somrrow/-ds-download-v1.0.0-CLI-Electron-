@@ -615,6 +615,58 @@ async function downloadLivePlaylist(opts) {
   return { partPath: `${targetPath}.part`, bytes: totalBytes, segments: seen.size, stopped, recordedSeconds };
 }
 
+/**
+ * 用 ffmpeg 看一眼这个文件**解不解得动**：返回 true = 视频编码未知/没有视频轨。
+ *
+ * 专治"抖音直播录下来是 HEVC 的 FLV"：内置 ffmpeg 的 FLV demuxer 不认 enhanced-RTMP
+ * 的 codec id 12，`ffmpeg -i` 只会打印 `Video: none ([12]…): unknown codec`，
+ * 转封装则报 `dimensions not set` 并留下 0 字节的 .mp4。
+ * 只在"转封装已经失败"之后调用，多一次 ffmpeg 调用的成本可以忽略。
+ */
+function detectUnknownVideoCodec(ffmpegPath, input) {
+  return new Promise((resolve) => {
+    if (!ffmpegPath) {
+      resolve(false);
+      return;
+    }
+    let err = '';
+    let child;
+    try {
+      child = spawn(ffmpegPath, ['-hide_banner', '-i', input], { windowsHide: true });
+    } catch {
+      resolve(false);
+      return;
+    }
+    if (!child || !child.stderr) {
+      resolve(false);
+      return;
+    }
+    if (child.stdout) child.stdout.resume();
+    child.stderr.on('data', (d) => {
+      if (err.length < 64000) err += d.toString();
+    });
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* ignore */
+      }
+    }, 20000);
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    child.on('close', () => {
+      clearTimeout(timer);
+      resolve(
+        /Video:\s*(?:none|unknown)\b/i.test(err) ||
+          /unknown codec/i.test(err) ||
+          /Video codec .*is not implemented/i.test(err),
+      );
+    });
+  });
+}
+
 /** 用 ffmpeg 无损转封装（-copyts -start_at_zero 可把直播的绝对时间轴归一到 0） */
 function remuxWithFfmpeg(ffmpegPath, input, output, { signal, logger = () => {} } = {}) {
   return new Promise((resolve, reject) => {
@@ -889,6 +941,7 @@ module.exports = {
   downloadLivePlaylist,
   muxWithFfmpeg,
   remuxWithFfmpeg,
+  detectUnknownVideoCodec,
   parseAttributes,
   parseResolution,
 };
