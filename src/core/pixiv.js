@@ -88,7 +88,9 @@ function writeDiskCache(data) {
 }
 
 function searchCacheKey(kw, opts, want) {
-  return `${kw}||${opts.mode || 'auto'}||${opts.allowR18 ? 'r18' : 'all'}||${want}`;
+  // ⚠️ excludeAI 必须进 key（2026-10-25）：否则「排除 AI」会直接命中上一次**没排除**的缓存，
+  //    表现就是选项明明开着、结果里还是 AI 图（实测踩到）。
+  return `${kw}||${opts.mode || 'auto'}||${opts.allowR18 ? 'r18' : 'all'}||${opts.excludeAI ? 'noai' : 'anyai'}||${want}`;
 }
 /**
  * 写缓存 / 记账熔断状态（2026-10-19 加；2026-10-20 重新放回 —— 之前替换 searchPixiv 时

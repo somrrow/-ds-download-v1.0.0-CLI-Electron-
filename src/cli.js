@@ -883,6 +883,8 @@ async function runPixivSearch(downloader, opts = {}) {
     // 已经发过的 pid：搜图时直接跳过（2026-10-20，插件会传进来）
     excludePids: Array.isArray(opts.excludePids) ? opts.excludePids : [],
     allowR18: Boolean(opts.allowR18),
+    // 排除 AI 生成的作品（2026-10-25）
+    excludeAI: Boolean(opts.excludeAI),
     listOnly: Boolean(opts.listOnly),
     outDir,
     signal: opts.signal,
