@@ -335,11 +335,26 @@ async function searchPixiv(keyword, opts = {}) {
   const collected = [];
   const seen = new Set(excludeSet);
   const usedBackends = [];
+  /**
+   * 排除 AI 生成作品（2026-10-25，参照 pixiv-illust 插件的同名设置）。
+   *
+   * pixiv 原生搜索**没有**可用的 ai_type 过滤参数（实测带 `ai_type=2` 直接变 0 条），
+   * 所以这里做**标签过滤**：AI 作品几乎都会打 `AI` / `AI生成` / `AIイラスト` /
+   * `Stable Diffusion` / `NovelAI` 这类标签。lolicon 那边另有服务端参数 `excludeAI=true`，
+   * 两边一起用，双保险。
+   */
+  const excludeAI = opts.excludeAI === true;
+  let aiSkipped = 0;
   const take = (items, label) => {
     let added = 0;
     for (const it of Array.isArray(items) ? items : []) {
       const pid = String(it?.pid || '').trim();
       if (!pid || seen.has(pid)) continue;
+      if (excludeAI && isAiWork(it)) {
+        seen.add(pid);
+        aiSkipped += 1;
+        continue;
+      }
       seen.add(pid);
       collected.push(it);
       added += 1;
@@ -414,7 +429,10 @@ async function searchPixiv(keyword, opts = {}) {
     }
   }
 
-  if (!collected.length) return { items: [], backend: 'none', errors };
+  if (!collected.length) {
+    if (aiSkipped) errors.push(`结果里 ${aiSkipped} 条都是 AI 作品，已按「排除 AI」设置过滤掉`);
+    return { items: [], backend: 'none', errors };
+  }
 
   const backend = usedBackends.join('+');
   if (useDiskCache) saveSearchCache(cache, cacheKey, collected.slice(0, want));
@@ -549,6 +567,23 @@ function mapSearchItems(raw) {
     });
   }
   return out;
+}
+
+/**
+ * 这是不是 **AI 生成**的作品（2026-10-25，配合「排除 AI 生成的作品」设置）。
+ *
+ * 判定依据：标签。pixiv 的 AI 作品几乎都会打下面这些标签之一；
+ * 原生搜索没有 ai_type 过滤（实测会直接把结果变 0 条），所以只能靠标签。
+ * 标题里出现 "AI" 不算 —— 「AI」当普通单词用的标题太多了，误杀比漏杀更烦。
+ */
+function isAiWork(item) {
+  if (!item) return false;
+  const tags = Array.isArray(item.tags) ? item.tags : [];
+  return tags.some((tag) =>
+    /^(?:ai|ai生成|aiイラスト|aiアート|aiart|ai-art|aiグラビア|ai画像|ai絵|人工知能|novelai|nijijourney|niji・journey|midjourney|stable[\s_-]?diffusion|sdxl|dall[\s._-]?e(?:\s*\d)?|generated(?:\s*by\s*ai)?)$/i.test(
+      String(tag || '').trim(),
+    ),
+  );
 }
 
 /**
@@ -1298,6 +1333,7 @@ module.exports = {
   searchPixivByPid,
   mapSearchItems,
   ratingOf,
+  isAiWork,
   searchAndDownloadPixiv,
   workFolderName,
   fetchPixivViaMirror,

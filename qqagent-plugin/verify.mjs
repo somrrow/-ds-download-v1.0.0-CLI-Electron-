@@ -539,6 +539,24 @@ if (process.argv.includes('--search')) {
     console.log(`  ✗ 找不到工具源码 ${pixivCorePath}`);
   }
 
+  // ⑥.5 排除 AI 生成的作品（2026-10-25，参照 pixiv-illust 插件的同名设置）
+  {
+    const px = (await import(pathToFileURL(pixivCorePath).href)).default || {};
+    const aiCases = [
+      [{ tags: ['AI'] }, true],
+      [{ tags: ['AI生成'] }, true],
+      [{ tags: ['aiイラスト'] }, true],
+      [{ tags: ['Stable Diffusion'] }, true],
+      [{ tags: ['NovelAI'] }, true],
+      [{ tags: ['初音ミク', '女の子'] }, false],
+      [{ title: 'AI 时代的少女', tags: ['オリジナル'] }, false]
+    ];
+    const wrong = aiCases.filter(([item, want]) => px.isAiWork?.(item) !== want);
+    const okAi = wrong.length === 0;
+    if (!okAi) bad += 1;
+    console.log(`  ${okAi ? '✓' : '✗'} AI 作品判定（${aiCases.length - wrong.length}/${aiCases.length} 条判定正确）`);
+  }
+
   // ⑦ 失败原因必须**分得清**：不能把"Pixiv 上真的没这个标签"说成"要挂代理"
   //    （2026-10-18 真实误诊：代理开着、原生搜索也跑通了，只是没有这个标签，
   //      旧规则却回了"先挂上代理再让我试"）

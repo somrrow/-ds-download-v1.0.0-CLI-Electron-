@@ -1,29 +1,48 @@
 # 更新日志
 
+## v1.0.2（2026-10-25）
+
+### 新增
+
+- **排除 AI 生成的作品**（参照 `pixiv-illust` 插件的同名设置）：
+  - 工具：`--pixiv-search` 加 `--exclude-ai`；
+  - 插件：设置项「排除 AI 生成的作品」（默认关）；
+  - 实现：内置接口走服务端参数 `excludeAI=true`；原生搜索按**标签**过滤
+    （`AI` / `AI生成` / `AIイラスト` / `Stable Diffusion` / `NovelAI` / `Midjourney` 等）。
+    pixiv 原生搜索**没有**可用的 `ai_type` 参数（实测带上 `ai_type=2` 直接 0 条），所以只能按标签判定。
+  - 全部结果都被过滤时会明确提示「结果里 N 条都是 AI 作品，已按设置过滤掉」，而不是静默返回空。
+
+### 修复
+
+- **抖音风控页不再白等**：以前要等 43~95 秒才报「要人机验证」，现在 **2 秒**识别、整条失败路径 **7 秒**结束；
+  提示改成能照做的三步（退出 Edge 让插件导出新登录态 / 桌面版里手动过一次验证 / 用调试端口让工具驱动真浏览器）。
+  另附新增 `src/core/douyin.js`（ttwid + detail 接口实现）：实测 2026-10 起 Argus 返回
+  `403 Blocked by ArgusSecurityPlugin Uifid Not Found`，**暂未接入主流程**，等接口恢复可直接接回；
+  README 增加了「抖音为什么会跳人机验证」的实测对照表。
 ## v1.0.1（2026-10-23）
 
 这一版主要是**修「下载/搜图时不时失败、视频没声音」这一类实际问题**，外加一批 Pixiv 搜图的能力。
 
 ### 修复
 
-- **经代理的请求读不完响应体**（`src/core/proxy-fetch.js`）
-  `toFetchResponse()` 里同一个响应流被两个消费者抢（`Readable.toWeb` 已经接管，`arrayBuffer()` 又去 `collect()`），
-  body 的 `end` 永远不触发 → 表现为「连接被重置 / 请求超时」，而且时好时坏。
-  现场对照：同一时刻 .NET 400ms 拿到 56KB、裸 socket 579ms 拿到 63KB，只有我们这条路径 6 秒读不完。
+- **经代理的请求读不完响应体**（`src/core/proxy-fetch.js`）  
+  `toFetchResponse()` 里同一个响应流被两个消费者抢（`Readable.toWeb` 已经接管，`arrayBuffer()` 又去 `collect()`），  
+  body 的 `end` 永远不触发 → 表现为「连接被重置 / 请求超时」，而且时好时坏。  
+  现场对照：同一时刻 .NET 400ms 拿到 56KB、裸 socket 579ms 拿到 63KB，只有我们这条路径 6 秒读不完。  
   修好后同一条路径 **200 / ~600ms / 74KB**。
-- **下载下来的视频没有声音**（`src/core/ytdlp.js`，小红书等）
-  格式选择器挑中了纯视频流（实测那条文件比正常版正好少一条音轨：5,021,869B vs 5,394,682B）。
-  现在：① 选择器显式要求 `acodec!=none`；② 下完用 `mediaHasAudio()` 复检，没有音轨就自动用
+- **下载下来的视频没有声音**（`src/core/ytdlp.js`，小红书等）  
+  格式选择器挑中了纯视频流（实测那条文件比正常版正好少一条音轨：5,021,869B vs 5,394,682B）。  
+  现在：① 选择器显式要求 `acodec!=none`；② 下完用 `mediaHasAudio()` 复检，没有音轨就自动用  
   `b[acodec!=none]/bv*+ba/b` 重下一次，并在日志里写明。
-- **Pixiv 图床单路硬扛导致搜图 360 秒超时**（`src/core/pixiv.js`）
-  改成**并行测速 + 多路兜底**：`i.pixiv.re / i.pixiv.cat / i.pixiv.nl / i.pximg.net` 各取 64KB 量速度，
-  小图最快的两条抢跑、大图走最快那条并按大小估算截止（30~180 秒），预计超过 240 秒则立刻失败并提示「图床太慢」；
-  成功的图床记进 `%LOCALAPPDATA%\vgrab\image-host.txt`。
+- **Pixiv 图床单路硬扛导致搜图 360 秒超时**（`src/core/pixiv.js`）  
+  改成**并行测速 + 多路兜底**：`i.pixiv.re / i.pixiv.cat / i.pixiv.nl / i.pximg.net` 各取 64KB 量速度，  
+  小图最快的两条抢跑、大图走最快那条并按大小估算截止（30~180 秒），预计超过 240 秒则立刻失败并提示「图床太慢」；  
+  成功的图床记进 `%LOCALAPPDATA%\vgrab\image-host.txt`。  
   实测同一关键词：**676 秒且失败 → 78 秒两个作品都成功**。
 
 ### 新增（Pixiv 搜图）
 
-- **按 pid / uid / 作者搜**：输入 `pixiv.net/artworks/<pid>`、纯数字 pid、`pixiv.net/users/<uid>`、`uid:123` 都能识别
+- **按 pid / uid / 作者搜**：输入 `pixiv.net/artworks/<pid>`、纯数字 pid、`pixiv.net/users/<uid>`、`uid:123` 都能识别  
   （作者名需要登录态；没登录会明确提示改用 uid 或主页链接）。
 - **顺序补齐**：`第三方(简体) → 第三方(繁体) → 原生(简体) → 原生(繁体)`，每一步累积、够了就停，不够就继续取完。
 - **数量没有硬上限**：默认 3，最多 500（原来是 20 / 插件侧还卡 5）。
@@ -34,7 +53,7 @@
 
 ### 其它
 
-- QQ Agent 插件（`qqagent-plugin/`）同步：确定性搜图指令、固定话带关键词、图片换指纹避免 QQ fast-upload 静默丢弃、
+- QQ Agent 插件（`qqagent-plugin/`）同步：确定性搜图指令、固定话带关键词、图片换指纹避免 QQ fast-upload 静默丢弃、  
   插件版本号随主版本更新到 1.0.1。
 - 桌面版：`dist/ds-download-1.0.1-win-x64/`（免安装，自带 Electron + yt-dlp/ffmpeg）。
 

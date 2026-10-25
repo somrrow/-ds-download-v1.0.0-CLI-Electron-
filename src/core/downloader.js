@@ -803,9 +803,16 @@ class VideoDownloader extends EventEmitter {
        * 风控页要**明确报出来**，不能让上层退回 yt-dlp 再抛一串 "ConnectionResetError" ——
        * 那样群里只会看到"这个视频没下下来"，用户完全不知道该怎么办（2026-10-17 真实现场）。
        */
+      /**
+       * 风控页要说清楚**怎么办**（2026-10-24 更新）：
+       * 实测「关掉 Edge 让插件导出新 cookie」是最省事的一条 —— 插件默认读的是
+       * `%APPDATA%\ds-download\tools\login-cookies.txt`（可能已经几天没更新），
+       * 而 Edge 里的登录态通常还新鲜；Edge 运行时它的 cookie 库被独占，导不出来。
+       */
       const hint =
-        `站点要求人机验证（标题：${pageTitle || '验证码页'}）：这台机器上用桌面版工具的内置浏览器` +
-        '打开一次该站点、把验证过掉（需要登录的顺手登录），之后就会带着这份 cookie 正常下载';
+        `站点要求人机验证（标题：${pageTitle || '验证码页'}）。可以试：① 完全退出 Edge，再发一次链接` +
+        '（插件会自动导出你 Edge 里的新登录态）；② 或在桌面版工具里打开该链接、手动过一次验证；' +
+        '③ 抖音这类风控强的站点，最稳的是让工具驱动你**平时在用的浏览器**（需要以调试端口启动，见 README）';
       this.lastBlockedReason = hint;
       log(hint, { notice: true });
       return null;

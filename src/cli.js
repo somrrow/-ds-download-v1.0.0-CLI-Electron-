@@ -126,6 +126,7 @@ const HELP = `
       --count <数量>         搜索时下载几个作品（默认 3，**没有硬上限**；不是 -n，-n 是 --name）
       --exclude-pids <pids>  已经发过的作品 pid（逗号分隔），搜图时跳过（插件自动传）
       --r18                 搜索时允许成人向作品（默认只出全年龄；群聊里别开）
+      --exclude-ai          搜索时排除 AI 生成的作品（按标签判定，默认不排除）
       --list-only           只列出搜索结果，不下载
       --pixiv-source <来源>  Pixiv 取图来源：auto（默认，先官方接口再自动退回反代）/ api / mirror
       --login [站点|网址]   用内置浏览器登录任意站点：bilibili / douyin / youtube / x /
@@ -306,6 +307,10 @@ function parseArgs(argv) {
         opts.count = Math.max(1, Math.min(500, Number(need(i, a)) || 1));
         break;
       }
+      case '--exclude-ai':
+        // 搜图时排除 AI 生成的作品（按标签判定，2026-10-25；参照 pixiv-illust 插件的同名设置）
+        opts.excludeAI = true;
+        break;
       case '--r18':
         opts.allowR18 = true;
         break;

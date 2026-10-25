@@ -2040,6 +2040,8 @@ async function runPixivSearchToolCli(keyword, count, c = cfg()) {
     // 写成 `-n 2` 会被当成"文件名 = 2"，搜出来的图全叫 2.png（踩过）。
     const args = [cli, '--pixiv-search', keyword, '--count', String(count), '-o', target, '--json', '--quiet'];
     if (c.pixivAllowR18 === true) args.push('--r18');
+    // 排除 AI 生成的作品（2026-10-25；参照 pixiv-illust 插件的同名设置）
+    if (c.pixivExcludeAI === true) args.push('--exclude-ai');
     /**
      * 节点自救（2026-10-19，插件设置里**默认关**）。
      * 打开后：原生搜索被代理重置时，工具会通过 Clash 的控制接口把代理组切到一个

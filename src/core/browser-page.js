@@ -500,25 +500,59 @@ async function extractPageMediaInProcess(
     if (first === 'media') onLog('页面还在加载，但已经抓到视频请求，提前进入提取');
     else if (first === 'timeout') loadNote = loadNote || `页面加载超过 ${Math.round(loadTimeoutMs / 1000)} 秒，继续尝试提取`;
     if (loadNote) onLog(loadNote);
-    await new Promise((r) => setTimeout(r, waitSec * 1000));
+
+    /**
+     * 风控页**早停**（2026-10-24）：抖音的「验证码中间页」会一直停着不动，
+     * 原来的流程要等满 loadTimeout + waitSec + maxWaitSec ≈ 40 秒才报错，纯浪费。
+     * 这里每秒瞄一眼标题/正文，认出来就立刻结束等待，把"要人机验证"尽快交给上层。
+     */
+    const looksBlocked = async () => {
+      try {
+        const text = await withTimeout(
+          win.webContents.executeJavaScript(
+            `(document.title || '') + ' ' + String((document.body && document.body.innerText) || '').slice(0, 400)`,
+          ),
+          2500,
+          '检测风控页',
+        );
+        return /验证码|安全验证|人机验证|滑动验证|访问异常|环境异常|captcha|just a moment|attention required|access denied|verify you are human|bot detection/i.test(
+          String(text || ''),
+        );
+      } catch {
+        return false;
+      }
+    };
+    let blockedEarly = false;
+    for (let i = 0; i < Math.max(1, Math.ceil(waitSec)); i += 1) {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (await looksBlocked()) {
+        blockedEarly = true;
+        break;
+      }
+    }
+    if (blockedEarly) onLog('页面是风控/验证码页，提前结束等待（不再白等几十秒）', { notice: true });
 
     // 页面里的 <video> 常是懒加载，滚动 + 尝试播放，促使播放器去拉流
-    try {
-      await withTimeout(
-        win.webContents.executeJavaScript(`(() => {
-          window.scrollTo(0, 400);
-          const v = document.querySelector('video');
-          if (v) { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(() => {}); }
-          return true;
-        })()`),
-        6000,
-        '触发播放',
-      );
-    } catch (err) {
-      onLog(`触发播放失败（忽略）：${err.message}`);
+    // （风控页没有播放器，这一步直接跳过）
+    if (!blockedEarly) {
+      try {
+        await withTimeout(
+          win.webContents.executeJavaScript(`(() => {
+            window.scrollTo(0, 400);
+            const v = document.querySelector('video');
+            if (v) { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+            return true;
+          })()`),
+          6000,
+          '触发播放',
+        );
+      } catch (err) {
+        onLog(`触发播放失败（忽略）：${err.message}`);
+      }
     }
     // 等媒体请求出现（音视频分开时要等两条；拿到第一条后再等几秒补齐音轨即可）
-    const deadline = Date.now() + maxWaitSec * 1000;
+    // 风控页不用等：页面本身就不会发播放请求，多等只会让群里多等半分钟
+    const deadline = blockedEarly ? Date.now() : Date.now() + maxWaitSec * 1000;
     const hasVideo = () => networkUrls.some((u) => !isAudioMediaUrl(u));
     const hasAudio = () => networkUrls.some((u) => isAudioMediaUrl(u));
     let firstSeenAt = 0;

@@ -1,6 +1,6 @@
 {
   "name": "ds-download",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "肥鱼当劳（ds-download）：本地视频下载工具，支持直链视频、HLS(m3u8) 流，以及 yt-dlp 覆盖的各类站点；命令行与 Electron 桌面界面共用同一套引擎。",
   "main": "src/gui/main.js",

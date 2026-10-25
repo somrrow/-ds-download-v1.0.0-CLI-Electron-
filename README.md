@@ -40,12 +40,12 @@
 ### 已打包的免安装版（双击 exe）
 
 ```
-dist\ds-download-1.0.1-win-x64\ds-download.exe     ← 双击即可，不需要 Node
+dist\ds-download-1.0.2-win-x64\ds-download.exe     ← 双击即可，不需要 Node
 ```
 
 不用装 Node、不用 npm install，包里自带 Electron 运行时与 yt-dlp/ffmpeg（首启动会自动复制到
 `%APPDATA%\ds-download\tools`）。整个目录拷到哪台 Windows 上都能跑；要发给别人就发
-`dist\ds-download-1.0.1-win-x64.zip`（对方**先解压**再双击 exe；没签名的 exe 第一次打开
+`dist\ds-download-1.0.2-win-x64.zip`（对方**先解压**再双击 exe；没签名的 exe 第一次打开
 可能被 SmartScreen 拦一下，点「更多信息 → 仍要运行」即可）。
 
 自己重新打一份包（改完代码后）：
@@ -216,7 +216,7 @@ dist/                       打包产物（便携目录 + zip）
 `node_modules/electron/dist` 里那份运行时：
 
 ```
-dist/ds-download-1.0.1-win-x64/
+dist/ds-download-1.0.2-win-x64/
   ds-download.exe           ← 双击即开（Electron 运行时改名而来，app.isPackaged = true）
   ds-download.ico           ← 快捷方式/资源管理器图标
   *.dll / icudtl.dat / locales/ …       Electron 运行时
@@ -408,3 +408,26 @@ pixiv 的 R-18 / 需登录作品还要先「登录」（内置浏览器登录 pi
 ## 免责声明
 
 本工具仅用于下载你有权存取的内容，例如自有素材、公开许可视频或已获授权的内容。请遵守目标网站的服务条款与当地法律，不要用于侵犯版权或规避付费墙。
+
+### 抖音为什么会跳人机验证
+
+2026-10 起抖音上了 **ArgusSecurityPlugin**，把「直接调接口」这条老路封了：
+
+| 尝试 | 结果（本机实测 2026-10-24） |
+| --- | --- |
+| `aweme/v1/web/aweme/detail/` + `ttwid` | 403 `Blocked by ArgusSecurityPlugin Uifid Not Found` |
+| 同上，走代理 / 换移动 UA / 移动站 `m.douyin.com` | 全部 403 |
+| `iesdouyin` 分享页 `_ROUTER_DATA` | 只剩空壳（约 32KB，没有 `videoInfoRes`） |
+| `web/api/v2/aweme/iteminfo/`、`aweme.snssdk.com` 老接口 | 空响应 |
+
+Argus 要的是 `uifid`（浏览器指纹）+ `msToken` + `a_bogus`（JS 签名），都是浏览器现场生成的，
+HTTP 层拿不到。所以现在**只能走浏览器通道**：
+
+- 工具用内置 Chromium 打开页面，监听播放器发出的视频请求；
+- 页面若是「验证码中间页」，会在 **2~7 秒内**识别并直接告诉你怎么办（不再白等 40~90 秒）；
+- 提高成功率：**完全退出 Edge 再发链接**（工具会自动导出你 Edge 里的新登录态；
+  Edge 运行时它的 cookie 库被独占，导不出来），或在桌面版里手动过一次验证。
+
+> 想让工具直接驱动你**平时在用的浏览器**（成功率最高）：用调试端口启动它，例如
+> `start msedge --remote-debugging-port=9222`，然后保持登录。这条通道还没接进工具，
+> 需要的话可以加。
