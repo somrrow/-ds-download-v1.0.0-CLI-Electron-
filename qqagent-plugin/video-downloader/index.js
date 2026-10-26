@@ -194,6 +194,8 @@ const DEFAULTS = {
   searchCommand: true,
   searchCommandMaxLen: 40,
   pixivAllowR18: false,
+  // 允许成人向的会话名单（2026-10-26）：群:123 / 私聊:456 / 裸数字=不限类型
+  pixivR18Chats: '',
   videoAsFileMb: 100,
   concurrency: 1,
   timeoutSec: 300,
@@ -1964,11 +1966,12 @@ async function handleDownload(args = {}) {
     if (result.ok) {
       // 成人向作品默认**不发到群里**（link 这条路上也可能贴到 R18 作品）。
       // 工具会在反代取图时顺带反查分级，放进 JSON 的 pixivRating 里。
-      if (result.pixivRating > 0 && c.pixivAllowR18 !== true) {
+      // 只能发到「全局开关打开」或「这个会话在名单里」的地方（2026-10-26）。
+      if (result.pixivRating > 0 && !chatAllowsR18(c, { kind, chatId, chatKey })) {
         warn('作品是成人向，按设置没有发出来：%s', url);
         return {
           ok: false,
-          error: '成人向作品（插件设置里「允许成人向」未打开）',
+          error: '成人向作品（插件设置里「允许成人向」未打开，且本会话不在成人向名单里）',
           friendly: '这个是成人向作品，按当前设置就不发出来了'
         };
       }
@@ -2019,7 +2022,7 @@ function searchDir(keyword, c = cfg()) {
 }
 
 /** 跑一次 `--pixiv-search`，返回工具输出的 JSON（数组或单个对象归一化成数组） */
-async function runPixivSearchToolCli(keyword, count, c = cfg()) {
+async function runPixivSearchToolCli(keyword, count, c = cfg(), opts = {}) {
   // 反代取图本身不需要登录态，但带上它能让部分受限作品可用（和链接下载用同一份来源）
   const cookiesFile = await resolveCookiesFile(c);
   return new Promise((resolve) => {
@@ -2039,7 +2042,8 @@ async function runPixivSearchToolCli(keyword, count, c = cfg()) {
     // ⚠️ 用 --count 而不是 -n：那个工具里 -n 是 --name（输出文件名），
     // 写成 `-n 2` 会被当成"文件名 = 2"，搜出来的图全叫 2.png（踩过）。
     const args = [cli, '--pixiv-search', keyword, '--count', String(count), '-o', target, '--json', '--quiet'];
-    if (c.pixivAllowR18 === true) args.push('--r18');
+    // 成人向：全局开关 or 当前会话在名单里（2026-10-26）
+    if (opts.r18 === true || c.pixivAllowR18 === true) args.push('--r18');
     // 排除 AI 生成的作品（2026-10-25；参照 pixiv-illust 插件的同名设置）
     if (c.pixivExcludeAI === true) args.push('--exclude-ai');
     /**
@@ -2303,6 +2307,46 @@ function backendNoteText(backend, keyword) {
   return `ⓘ 这次的结果来源：${b}${tail}`;
 }
 
+/**
+ * 「哪些群聊 / 私聊允许成人向」（2026-10-26 用户要求）。
+ *
+ * 名单写法（逗号、空格、换行、分号都能当分隔符）：
+ *   `群:1027015568` / `group:1027015568` → 只对这个群开
+ *   `私聊:123456789` / `private:123456789` / `好友:123456789` → 只对这个人的私聊开
+ *   `123456789`（裸数字）→ 群聊或私聊都算（省事；要精确就用上面两种）
+ * 总开关 `pixivAllowR18` 打开时对**所有**会话生效（名单就不用填了）。
+ */
+function parseR18ChatToken(token) {
+  const t = String(token || '').trim();
+  if (!t) return null;
+  const scoped = /^(群聊?|group|groupchat|私聊|好友|private|user|qq)\s*[:：]\s*(\d+)$/i.exec(t);
+  if (scoped) {
+    const isPrivate = /^(私聊|好友|private|user|qq)$/i.test(scoped[1]);
+    return { scope: isPrivate ? 'private' : 'group', id: scoped[2] };
+  }
+  if (/^\d+$/.test(t)) return { scope: 'any', id: t };
+  return null;
+}
+
+/** 当前会话是否允许成人向（全局开关 or 名单命中） */
+function chatAllowsR18(c = cfg(), { kind = '', chatId = '', chatKey = '' } = {}) {
+  if (c.pixivAllowR18 === true) return true;
+  const tokens = String(c.pixivR18Chats || '')
+    .split(/[\s,，;；、]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!tokens.length) return false;
+  const key = String(chatKey || (kind && chatId !== undefined ? `${kind}:${chatId}` : '')).toLowerCase();
+  const id = String(chatId !== undefined && chatId !== null && chatId !== '' ? chatId : key.split(':').pop() || '').trim();
+  if (!id) return false;
+  const chatKind = /^(group|群)/.test(key) || /group/.test(String(kind)) ? 'group' : 'private';
+  return tokens.some((token) => {
+    const parsed = parseR18ChatToken(token);
+    if (!parsed || parsed.id !== id) return false;
+    return parsed.scope === 'any' || parsed.scope === chatKind;
+  });
+}
+
 function searchPlan(mode) {
   const m = String(mode ?? 'download').toLowerCase();
   if (m === 'send') {
@@ -2321,8 +2365,8 @@ function searchPlan(mode) {
  * 确定性指令（`message.image-request`，0 token）。两条路必须下同样的东西，
  * 否则"指令下的图"和"工具下的图"迟早会长成两套行为。
  */
-async function searchOnce({ keyword, count, c, log = () => {} }) {
-  const res = await withSlot(() => runPixivSearchToolCli(keyword, count, c));
+async function searchOnce({ keyword, count, c, log = () => {}, r18 = false }) {
+  const res = await withSlot(() => runPixivSearchToolCli(keyword, count, c, { r18 }));
   if (!res.ok) return { ok: false, error: res.error, dir: res.dir };
 
   const okWorks = (res.results || []).filter((r) => r.ok);
@@ -2422,7 +2466,10 @@ async function performSearchRequest({ keyword, count, c, plan, sender, chatKey, 
   const startLine = withKw(plan.startText);
   if (startLine) await say(startLine);   // send 模式：收到指令先吱一声
 
-  const r = await searchOnce({ keyword, count, c, log });
+  // 成人向：全局开关 or「这个群/这个人」在名单里（2026-10-26）
+  const allowR18 = chatAllowsR18(c, { chatKey });
+  if (allowR18 && c.pixivAllowR18 !== true) log('[%s] 本会话在成人向名单里，这次允许 R18', source);
+  const r = await searchOnce({ keyword, count, c, log, r18: allowR18 });
   if (!r.ok) {
     // 失败就不发"图片正在发送"（那句只在图下好、真要发图之前发），但**必须回一句失败原因**
     await sayFailure(r.error);
@@ -3166,5 +3213,8 @@ export {
   canonicalUrlKey,
   // 换图片指纹（避免 QQ 的 fast-upload 命中导致消息被静默丢弃）；导出是为了自测
   uniqueImageForUpload,
-  backendNoteText
+  backendNoteText,
+  // 按会话判断谁允许成人向（2026-10-26；导出给自测）
+  chatAllowsR18,
+  parseR18ChatToken
 };

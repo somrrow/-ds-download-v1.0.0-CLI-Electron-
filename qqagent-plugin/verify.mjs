@@ -1247,6 +1247,27 @@ if (process.argv.includes('--cmd')) {
     if (!ok) bad += 1;
     console.log(`  ${ok ? '✓' : '✗'} 来源说明（${backend}）→ ${got}`);
   }
+  // 按会话开成人向（2026-10-26）：名单语法与匹配规则
+  {
+    const r18Cases = [
+      ['全局关+空名单', { pixivAllowR18: false, pixivR18Chats: '' }, { chatKey: 'group:1027015568' }, false],
+      ['全局开', { pixivAllowR18: true }, { chatKey: 'group:111' }, true],
+      ['群:1027015568 命中该群', { pixivR18Chats: '群:1027015568' }, { chatKey: 'group:1027015568' }, true],
+      ['同名单，别的群', { pixivR18Chats: '群:1027015568' }, { chatKey: 'group:222' }, false],
+      ['同名单，同号私聊不算', { pixivR18Chats: '群:1027015568' }, { chatKey: 'private:1027015568' }, false],
+      ['私聊:123456 命中私聊', { pixivR18Chats: '私聊:123456' }, { chatKey: 'private:123456' }, true],
+      ['私聊名单，同号群聊不算', { pixivR18Chats: '私聊:123456' }, { chatKey: 'group:123456' }, false],
+      ['裸数字（群）', { pixivR18Chats: '123456' }, { chatKey: 'group:123456' }, true],
+      ['裸数字（私聊）', { pixivR18Chats: '123456' }, { chatKey: 'private:123456' }, true],
+      ['多名单+换行', { pixivR18Chats: '群:1, 私聊:2\n群:3' }, { chatKey: 'group:3' }, true],
+      ['全角冒号+大小写', { pixivR18Chats: 'Group：42' }, { chatKey: 'group:42' }, true],
+      ['非法 token', { pixivR18Chats: '乱写' }, { chatKey: 'group:1' }, false]
+    ];
+    const wrong = r18Cases.filter(([, c, chat, want]) => mod.chatAllowsR18(c, chat) !== want);
+    const okR18 = wrong.length === 0;
+    if (!okR18) bad += 1;
+    console.log(`  ${okR18 ? '✓' : '✗'} 按会话开成人向（${r18Cases.length - wrong.length}/${r18Cases.length} 条规则正确）`);
+  }
   console.log(`  ${okSend ? '✓' : '✗'} send 模式顺序：${order.join(' → ') || '(什么都没发)'}`);
   // 两句固定话必须是**插件自己通过发送管道直接发**（不经过模型）：上面用的就是 sender 探针，
   // 能收到 text 说明走的是 ctx.sender.sendTextBatch；而固定句式那条路模型根本不会被叫醒（veto）。
