@@ -449,6 +449,8 @@ HTTP 层拿不到。所以现在**只能走浏览器通道**：
    > 懒人版：双击 `build\start-cdp-browser.cmd`（用**独立 profile**，跟你日常的 Edge 不冲突，
    > 会自动等端口就绪）。**窗口可以最小化，但别关** —— 关掉最后一个窗口 = 进程退出 = 端口消失。
    > 想开机自启：把它的快捷方式放进 `shell:startup`（Win+R 输入 `shell:startup`）。
+   > 想**开机静默启动**（不弹黑框）：用 `build\start-cdp-browser-hidden.vbs`（`wscript.exe "<vbs 路径>"`）。
+   > 本机已经配好：桌面快捷方式「抖音下载-浏览器通道(CDP)」+ 启动项 `vgrab-cdp-browser.lnk`。
 
    - 命令行：`vgrab <链接> --cdp-port 9222`
    - 插件：设置项「抖音用你自己的浏览器（CDP 调试端口）」默认就是 9222，填 `0` 可关闭
