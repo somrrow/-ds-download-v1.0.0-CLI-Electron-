@@ -127,6 +127,7 @@ const HELP = `
       --exclude-pids <pids>  已经发过的作品 pid（逗号分隔），搜图时跳过（插件自动传）
       --r18                 搜索时允许成人向作品（默认只出全年龄；群聊里别开）
       --exclude-ai          搜索时排除 AI 生成的作品（按标签判定，默认不排除）
+      --cdp-port <端口>     用带调试端口的浏览器（默认 9222）下载抖音等强风控站点；--no-cdp 关闭该通道
       --list-only           只列出搜索结果，不下载
       --pixiv-source <来源>  Pixiv 取图来源：auto（默认，先官方接口再自动退回反代）/ api / mirror
       --login [站点|网址]   用内置浏览器登录任意站点：bilibili / douyin / youtube / x /
@@ -307,6 +308,14 @@ function parseArgs(argv) {
         opts.count = Math.max(1, Math.min(500, Number(need(i, a)) || 1));
         break;
       }
+      case '--cdp-port':
+        // 用带调试端口的浏览器（Edge/Chrome --remote-debugging-port=9222）下载抖音这类强风控站点
+        opts.cdpPort = Math.max(1, Number(need(i, a)) || 9222);
+        i += 1;   // ⚠️ 必须吃掉参数值，否则 "9222" 会被当成第二个 URL（实测报「不是有效的 http(s) 链接：9222」）
+        break;
+      case '--no-cdp':
+        opts.noCdp = true;
+        break;
       case '--exclude-ai':
         // 搜图时排除 AI 生成的作品（按标签判定，2026-10-25；参照 pixiv-illust 插件的同名设置）
         opts.excludeAI = true;
@@ -552,6 +561,9 @@ async function main() {
     autoDownloadYtDlp: opts.autoDownloadYtDlp !== false,
     autoFetchFfmpeg: opts.autoFetchFfmpeg !== false,
     browserAssist: opts.browserAssist !== false,
+    // CDP 通道：驱动用户自己带调试端口的浏览器（抖音风控强的站点用，2026-11-09）
+    cdpPort: opts.cdpPort,
+    cdp: opts.noCdp !== true,
     appRoot: path.resolve(__dirname, '..'),
     codec: opts.codec || 'h264',
     cookiesFile: opts.cookiesFile || (useLoginCookies ? loginCookiesFile() : ''),

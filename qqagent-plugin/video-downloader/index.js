@@ -196,6 +196,8 @@ const DEFAULTS = {
   pixivAllowR18: false,
   // 允许成人向的会话名单（2026-10-26）：群:123 / 私聊:456 / 裸数字=不限类型
   pixivR18Chats: '',
+  // 抖音走 CDP（用户自己带调试端口的浏览器）；0 = 关闭（2026-11-09）
+  cdpPort: 9222,
   videoAsFileMb: 100,
   concurrency: 1,
   timeoutSec: 300,
@@ -855,6 +857,9 @@ function runTool(url, c = cfg(), cookiesFile = '') {
     const args = [cli, url, '-o', target, '--json', '--quiet'];
     const quality = String(c.quality || '').trim();
     if (quality) args.push('-q', quality);
+    // 抖音走 CDP：驱动用户自己带调试端口的浏览器（2026-11-09）；cdpPort=0 表示关闭
+    if (Number(c.cdpPort) > 0) args.push('--cdp-port', String(Number(c.cdpPort)));
+    else args.push('--no-cdp');
     // 登录态：优先用**事先解析好**的那份（可能来自 Edge，见 resolveCookiesFile），
     // 没传就退回磁盘上的现成文件。这样 B 站会员清晰度、需要登录的站点在群里照样能下。
     const cookies = cookiesFile || findCookieFileOnDisk();

@@ -273,6 +273,30 @@ class VideoDownloader extends EventEmitter {
 
       const baseName = sanitizeFilename(opts.name || info.filename?.replace(/\.[a-z0-9]{2,5}$/i, '') || info.title || 'video', 'video');
 
+      /**
+       * 抖音先试 **CDP 通道**（2026-11-09）：驱动用户自己带调试端口的浏览器。
+       * 抖音的 Argus 风控要求 uifid / msToken / a_bogus（浏览器现场生成），
+       * 内置 Electron 是冷会话 → 几乎必出验证码；用用户平时的浏览器则基本不弹。
+       * 没有调试端口时这里会很快返回 null，继续走 yt-dlp / 内置浏览器，不会更差。
+       */
+      if (opts.cdp !== false && /(?:^|\.)(?:douyin\.com|iesdouyin\.com)$|douyin\.ie$/i.test((() => {
+        try { return new URL(url).hostname.toLowerCase(); } catch { return ''; }
+      })())) {
+        const viaCdp = await this.#tryCdpAssist(url, {
+          ...opts,
+          outDir,
+          baseName,
+          cookies,
+          signal,
+          ffmpegPath,
+          task,
+          emitProgress,
+          log,
+          startedAt,
+        });
+        if (viaCdp) return viaCdp;
+      }
+
       // ---- yt-dlp 通道
       if (wantsYtDlp) {
         let bin = ytDlpPath;
@@ -754,6 +778,70 @@ class VideoDownloader extends EventEmitter {
    * 拿到真正的视频地址后用内置下载器下载。
    * 适用于抖音这类「yt-dlp 尚未支持签名」或强反爬的站点。
    */
+  /**
+   * CDP 通道：驱动**用户自己带调试端口的浏览器**抓播放地址并下载（2026-11-09）。
+   *
+   * 抖音的 Argus 风控要 uifid / msToken / a_bogus —— 全是浏览器现场生成的；
+   * 用内置 Electron（冷会话、新指纹）几乎必出「验证码中间页」，
+   * 用用户平时那个浏览器（`start msedge --remote-debugging-port=9222`）则基本不弹。
+   *
+   * 返回 null 表示"这条通道不可用或没抓到"，调用方继续走 yt-dlp / 内置浏览器。
+   */
+  async #tryCdpAssist(pageUrl, ctx) {
+    const { outDir, baseName, signal, task, emitProgress, log, startedAt } = ctx;
+    const opts = { ...ctx };
+    if (opts.cdp === false) return null;
+    let mod;
+    try {
+      mod = require('./cdp-browser');
+    } catch {
+      return null;
+    }
+    let got;
+    try {
+      got = await mod.harvestViaCdp({
+        url: pageUrl,
+        port: opts.cdpPort,
+        waitSec: opts.cdpWaitSec || 25,
+        onLog: (m) => log(m),
+      });
+    } catch (err) {
+      log(`CDP 通道不可用（${err.message}），改用内置浏览器`, { notice: true });
+      return null;
+    }
+    const pageText = `${got.title || ''} ${got.bodyText || ''}`;
+    if (!got.videoUrl) {
+      log(`CDP：页面打开了但没抓到播放地址（标题：${String(got.title || '').slice(0, 40) || '空'}）`);
+      if (/验证码|安全验证|人机验证|访问异常|captcha/i.test(pageText)) {
+        this.lastBlockedReason =
+          `站点要求人机验证（标题：${String(got.title || '验证码页')}）：这次用的是带调试端口的浏览器，仍被拦截 —— ` +
+          '在这个浏览器窗口里手动过一次验证，然后再发一次链接';
+      }
+      return null;
+    }
+    const title = sanitizeFilename(String(got.title || baseName || 'douyin').slice(0, 120), baseName || 'douyin');
+    const outPath = this.#resolveOutPath(outDir, title, '.mp4', opts.overwrite);
+    log(`CDP：拿到播放地址（${got.browser || '浏览器'} :${got.port}），开始下载`, { notice: true });
+    const result = await downloadDirect({
+      ...opts,
+      url: got.videoUrl,
+      outPath,
+      // 抖音 CDN 认 Referer，不带会被 403
+      referer: 'https://www.douyin.com/',
+      headers: { ...(opts.headers || {}) },
+      signal,
+      onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
+      logger: log,
+    });
+    return this.#finish(task.id, {
+      filePath: result.filePath,
+      bytes: result.bytes,
+      engine: 'cdp',
+      title,
+      startedAt,
+    });
+  }
+
   async #tryBrowserAssist(pageUrl, info, ctx) {
     const { outDir, baseName, signal, task, emitProgress, log, startedAt } = ctx;
     const opts = { ...ctx };
