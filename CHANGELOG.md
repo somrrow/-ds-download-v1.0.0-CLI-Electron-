@@ -1,5 +1,19 @@
 # 更新日志
 
+## v1.0.5（2026-11-09）
+
+### 修复
+
+- **CDP 下载时最小化的窗口会弹到前台**（用户报"每次下载后台最小化的窗口都会弹出来"）。
+  原因：CDP 建标签用的是 `PUT /json/new?…`，它把窗口状态从 `minimized` 变成 `normal`。
+  改成：
+  - 用浏览器级 WS 的 `Target.createTarget({ background: true })` 建**后台**标签（实测窗口保持 `minimized`）；
+  - 后台标签会被浏览器节流（页面打开了但播放器不渲染、也不发媒体请求，标题都是空的），
+    所以再加 `Emulation.setFocusEmulationEnabled(true)` + `Page.setWebLifecycleState('active')`
+    让它"以为自己是前台、且没被冻结"——实测能正常抓到播放地址；
+  - 收尾用 `Target.closeTarget`（`/json/close` 也可能激活窗口）。
+
+  实测：窗口全程 `minimized`，抓取 7 秒、下载 7.2 秒 / 15.2 MB，无弹窗。
 ## v1.0.4（2026-11-09）
 
 ### 新增

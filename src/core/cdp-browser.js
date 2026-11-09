@@ -344,13 +344,50 @@ async function harvestViaCdp(opts = {}) {
     throw new Error('没有找到带调试端口的浏览器（用 `start msedge --remote-debugging-port=9222` 启动一个）');
   }
   onLog(`CDP：连上 ${browser.browser || '浏览器'}（端口 ${browser.port}）`);
-  // 新标签页
-  const page = await httpJson(browser.port, `/json/new?${encodeURIComponent(target)}`, 'PUT', 5000).catch(async () => {
-    // 某些版本要求 GET
-    return httpJson(browser.port, `/json/new?${encodeURIComponent(target)}`, 'GET', 5000);
-  });
-  const targetId = page && (page.id || page.targetId);
-  const wsUrl = page && page.webSocketDebuggerUrl;
+  /**
+   * 开标签页 **不能在后台窗口上"弹出来"**（2026-11-09 用户报：每次下载，最小化的窗口都会跳到前台）。
+   *
+   * 实测对比（同一个最小化窗口，用 `Browser.getWindowBounds` 看状态）：
+   *   `PUT /json/new?url=…`            → windowState 变 `normal`（窗口被拉到前台）❌
+   *   `Target.createTarget({background:true})` → 仍然是 `minimized` ✅
+   *
+   * 所以这里改成走浏览器级 WS 的 `Target.createTarget(background: true)`，
+   * 再用 `/json/list` 找到这个 target 的 page WS；用 `Target.closeTarget` 收尾。
+   * 实在不支持（老版本）才退回 `/json/new`。
+   */
+  const browserWs = await connectCdpWs(browser.webSocketDebuggerUrl, { timeoutMs: 6000 });
+  let targetId = '';
+  let wsUrl = '';
+  try {
+    const created = await cdpCall(browserWs, 'Target.createTarget', { url: 'about:blank', background: true }, { timeoutMs: 8000 });
+    targetId = String(created.targetId || '');
+    if (targetId) {
+      const list = await httpJson(browser.port, '/json/list', 'GET', 4000).catch(() => []);
+      const found = (Array.isArray(list) ? list : []).find((t) => String(t.id) === targetId);
+      wsUrl = found && found.webSocketDebuggerUrl;
+    }
+  } catch {
+    /* 老版本没有 background 参数：下面退回 /json/new */
+  }
+  if (!targetId || !wsUrl) {
+    const page = await httpJson(browser.port, `/json/new?${encodeURIComponent(target)}`, 'PUT', 5000).catch(async () => {
+      // 某些版本要求 GET
+      return httpJson(browser.port, `/json/new?${encodeURIComponent(target)}`, 'GET', 5000);
+    });
+    targetId = String((page && (page.id || page.targetId)) || '');
+    wsUrl = page && page.webSocketDebuggerUrl;
+    if (targetId) {
+      // 兜底路径：把窗口状态恢复成最小化（用户那边看到的是"闪一下又回去"，比一直挂着好）
+      try {
+        const win = await cdpCall(browserWs, 'Browser.getWindowForTarget', { targetId }, { timeoutMs: 3000 });
+        if (win && win.windowId) {
+          await cdpCall(browserWs, 'Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'minimized' } }, { timeoutMs: 3000 });
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
   if (!wsUrl) throw new Error('CDP：新标签页没有 webSocketDebuggerUrl');
   const ws = await connectCdpWs(wsUrl, { timeoutMs: 6000 });
   const candidates = [];
@@ -360,6 +397,14 @@ async function harvestViaCdp(opts = {}) {
     await cdpCall(ws, 'Page.enable', {}, { timeoutMs: 8000 }).catch(() => {});
     await cdpCall(ws, 'Runtime.enable', {}, { timeoutMs: 8000 }).catch(() => {});
     await cdpCall(ws, 'Network.enable', {}, { timeoutMs: 8000 }).catch(() => {});
+    /**
+     * 后台标签页会被浏览器节流：页面能打开、但不渲染播放器、也不发媒体请求
+     * （实测：只 createTarget(background) + navigate，标题都还是空的）。
+     * 这两条命令让后台标签"以为自己是前台、且没被冻结" —— 实测能正常出播放地址，
+     * 而窗口始终留在最小化状态（2026-11-09 用户报"每次下载窗口都会弹出来"）。
+     */
+    await cdpCall(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true }, { timeoutMs: 4000 }).catch(() => {});
+    await cdpCall(ws, 'Page.setWebLifecycleState', { state: 'active' }, { timeoutMs: 4000 }).catch(() => {});
     ws.onMessage((msg) => {
       if (msg && msg.__closed) return;
       if (msg.method === 'Network.requestWillBeSent' && msg.params && msg.params.request) {
@@ -419,8 +464,18 @@ async function harvestViaCdp(opts = {}) {
     } catch {
       /* ignore */
     }
+    // 关标签页用 Target.closeTarget（不会像 /json/close 那样可能激活窗口）
     if (targetId) {
-      httpJson(browser.port, `/json/close/${targetId}`, 'GET', 2000).catch(() => {});
+      try {
+        await cdpCall(browserWs, 'Target.closeTarget', { targetId }, { timeoutMs: 3000 });
+      } catch {
+        httpJson(browser.port, `/json/close/${targetId}`, 'GET', 2000).catch(() => {});
+      }
+    }
+    try {
+      browserWs.close();
+    } catch {
+      /* ignore */
     }
   }
   // 过滤掉 UI 静态资源，再按"像不像真播放地址"排序
