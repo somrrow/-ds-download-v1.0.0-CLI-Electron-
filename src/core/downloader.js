@@ -821,14 +821,75 @@ class VideoDownloader extends EventEmitter {
     }
     const title = sanitizeFilename(String(got.title || baseName || 'douyin').slice(0, 120), baseName || 'douyin');
     const outPath = this.#resolveOutPath(outDir, title, '.mp4', opts.overwrite);
+    const referer = 'https://www.douyin.com/';
+    const headers = { ...(opts.headers || {}) };
+    /**
+     * 抖音现在大量用 **DASH**：音视频是两条 URL（`…/media-video` 与 `…/media-audio-u`），
+     * 只下第一条就是无声视频（2026-11-12 用户报"抖音下下来没声音"）。
+     * 有音频轨就分别下载、再用 ffmpeg 合并（`muxWithFfmpeg` 是 -c copy，秒级）。
+     */
+    if (got.audioUrl) {
+      if (!ctx.ffmpegPath) {
+        log('CDP：这个视频的音视频是分开的，但没找到 ffmpeg，改用内置浏览器合并', { notice: true });
+        return null;
+      }
+      const suffix = randomId('cdp');
+      const videoTmp = path.join(outDir, `.vgrab-${suffix}-v.mp4`);
+      const audioTmp = path.join(outDir, `.vgrab-${suffix}-a.m4a`);
+      const rm = (f) => {
+        try {
+          fs.unlinkSync(f);
+        } catch {
+          /* ignore */
+        }
+      };
+      try {
+        emitProgress({ stage: 'download', percent: 0, message: '下载视频轨' });
+        log('CDP：音视频分开的（DASH），先下载视频轨…', { notice: true });
+        const v = await downloadDirect({
+          ...opts,
+          url: got.videoUrl,
+          outPath: videoTmp,
+          referer,
+          headers,
+          signal,
+          onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
+          logger: log,
+        });
+        emitProgress({ stage: 'download', percent: 0, message: '下载音频轨' });
+        log('CDP：再下载音频轨…', { notice: true });
+        const a = await downloadDirect({
+          ...opts,
+          url: got.audioUrl,
+          outPath: audioTmp,
+          referer,
+          headers,
+          signal,
+          logger: log,
+        });
+        emitProgress({ stage: 'download', percent: 0, message: '合并音视频' });
+        await muxWithFfmpeg(ctx.ffmpegPath, v.filePath, a.filePath, outPath, { signal });
+        log('CDP：音视频已合并', { notice: true });
+      } finally {
+        rm(videoTmp);
+        rm(audioTmp);
+      }
+      return this.#finish(task.id, {
+        filePath: outPath,
+        bytes: fileSize(outPath),
+        engine: 'cdp',
+        title,
+        startedAt,
+      });
+    }
     log(`CDP：拿到播放地址（${got.browser || '浏览器'} :${got.port}），开始下载`, { notice: true });
     const result = await downloadDirect({
       ...opts,
       url: got.videoUrl,
       outPath,
       // 抖音 CDN 认 Referer，不带会被 403
-      referer: 'https://www.douyin.com/',
-      headers: { ...(opts.headers || {}) },
+      referer,
+      headers,
       signal,
       onProgress: (p) => emitProgress({ stage: 'download', ...patchProgress(p) }),
       logger: log,

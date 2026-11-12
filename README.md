@@ -40,12 +40,12 @@
 ### 已打包的免安装版（双击 exe）
 
 ```
-dist\ds-download-1.0.5-win-x64\ds-download.exe     ← 双击即可，不需要 Node
+dist\ds-download-1.0.6-win-x64\ds-download.exe     ← 双击即可，不需要 Node
 ```
 
 不用装 Node、不用 npm install，包里自带 Electron 运行时与 yt-dlp/ffmpeg（首启动会自动复制到
 `%APPDATA%\ds-download\tools`）。整个目录拷到哪台 Windows 上都能跑；要发给别人就发
-`dist\ds-download-1.0.5-win-x64.zip`（对方**先解压**再双击 exe；没签名的 exe 第一次打开
+`dist\ds-download-1.0.6-win-x64.zip`（对方**先解压**再双击 exe；没签名的 exe 第一次打开
 可能被 SmartScreen 拦一下，点「更多信息 → 仍要运行」即可）。
 
 自己重新打一份包（改完代码后）：
@@ -216,7 +216,7 @@ dist/                       打包产物（便携目录 + zip）
 `node_modules/electron/dist` 里那份运行时：
 
 ```
-dist/ds-download-1.0.5-win-x64/
+dist/ds-download-1.0.6-win-x64/
   ds-download.exe           ← 双击即开（Electron 运行时改名而来，app.isPackaged = true）
   ds-download.ico           ← 快捷方式/资源管理器图标
   *.dll / icudtl.dat / locales/ …       Electron 运行时
@@ -459,6 +459,10 @@ HTTP 层拿不到。所以现在**只能走浏览器通道**：
 实测（2026-11-09，同一条抖音链接）：**8 秒、15.2 MB、带音轨**，没有验证码；
 而内置浏览器那条路是「验证码中间页」。
 
+> **音视频分开的（DASH）会自动合并**：抖音很多视频把画面和声音拆成两条 URL
+> （`…/media-video` 与 `…/media-audio-u`），工具会分别下载再用 `ffmpeg -c copy` 合并，
+> 不会出现"下下来没声音"的情况。
+>
 > **窗口不会弹出来**：工具用「后台标签 + 焦点模拟」抓地址，那个最小化的窗口全程保持最小化（实测
 > 抓取前后窗口状态都是 `minimized`）。
 >

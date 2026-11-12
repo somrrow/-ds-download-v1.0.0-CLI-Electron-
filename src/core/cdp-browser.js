@@ -301,7 +301,21 @@ function cdpCall(ws, method, params = {}, { timeoutMs = 15000 } = {}) {
   });
 }
 
-const MEDIA_URL_RE = /(?:douyinvod\.com|xhscdn\.com|\.mp4|mime_type=video|m3u8)/i;
+const MEDIA_URL_RE = /(?:douyinvod\.com|xhscdn\.com|\.mp4|mime_type=(?:video|audio)|media-audio|m3u8)/i;
+
+/**
+ * 抖音/字节的 **DASH 音频轨**（2026-11-12 用户报"抖音下下来没声音"）。
+ *
+ * 页面会把音视频拆成两条 URL：
+ *   …/video/tos/cn/…/media-video      ← 只有画面
+ *   …/video/tos/cn/…/media-audio-u    ← 只有声音
+ * 只取第一条就是无声视频。所以这里把音频单独识别出来，下载时再合并。
+ */
+const AUDIO_URL_RE = /(?:mime_type=audio|media-audio|audio_mp4|\/audio\/|\.m4a(?:\?|$)|\.mp3(?:\?|$))/i;
+
+function isAudioMediaUrl(url) {
+  return AUDIO_URL_RE.test(String(url || ''));
+}
 
 /** 明显是**页面静态资源**、不是视频的地址（抖音的 UI 动画 .mp4、图标、脚本） */
 function isStaticAsset(url) {
@@ -479,15 +493,26 @@ async function harvestViaCdp(opts = {}) {
     }
   }
   // 过滤掉 UI 静态资源，再按"像不像真播放地址"排序
+  // 音视频分开时（抖音 DASH）必须分别拿：只取第一条就是无声视频
   const usable = candidates.filter((u) => !isStaticAsset(u));
-  usable.sort((a, b) => scoreMediaUrl(b) - scoreMediaUrl(a));
-  const videoUrl = usable[0] || '';
-  if (videoUrl) onLog(`CDP：抓到播放地址（${usable.length} 个候选，首选 ${scoreMediaUrl(videoUrl)} 分）`);
+  const audioCandidates = usable.filter((u) => isAudioMediaUrl(u));
+  const videoCandidates = usable.filter((u) => !isAudioMediaUrl(u));
+  videoCandidates.sort((a, b) => scoreMediaUrl(b) - scoreMediaUrl(a));
+  const videoUrl = videoCandidates[0] || '';
+  // 优先选明确的 DASH 音轨（media-audio），其次其它音频地址
+  const audioUrl = audioCandidates.find((u) => /media-audio/i.test(u)) || audioCandidates[0] || '';
+  if (videoUrl) {
+    onLog(
+      `CDP：抓到播放地址（视频 ${videoCandidates.length} 个候选${audioUrl ? '，音频 1 个' : '（自带音轨）'}，首选 ${scoreMediaUrl(videoUrl)} 分）`,
+    );
+  }
   return {
     videoUrl,
+    audioUrl,
     title,
     bodyText,
-    candidates: usable,
+    candidates: videoCandidates,
+    audioCandidates,
     browser: browser.browser,
     port: browser.port,
   };
@@ -500,6 +525,8 @@ module.exports = {
   connectCdpWs,
   cdpCall,
   harvestViaCdp,
+  isAudioMediaUrl,
+  AUDIO_URL_RE,
   isStaticAsset,
   scoreMediaUrl,
   MEDIA_URL_RE,
